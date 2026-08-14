@@ -1,0 +1,35 @@
+services:
+  nanobot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nanobot-api-${REPL_SET_NAME}
+    cpus: "2.0"
+    env_file:
+      - .env
+    image: nanobot-api-${REPL_SET_NAME}
+    mem_limit: 4g
+    networks:
+      - mongo-net
+      - node-net
+      - backend-net
+      - work-net
+    pids_limit: 500
+    ports:
+      - "${API_PORT}:${API_PORT}"
+    pull_policy: never
+    restart: always
+    volumes:
+      - ./logs:/app/log
+
+networks:
+  backend-net:
+    external: true
+    name: ${BACKEND_NETWORK_NAME}
+  mongo-net:
+    external: true
+    name: ${MONGO_NETWORK_NAME}
+  node-net:
+    external: true
+  work-net:
+    external: true

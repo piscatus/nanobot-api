@@ -1,0 +1,8 @@
+.env
+.env.DEV
+.env.PRD
+logs/*
+!logs/README.md
+log/*
+!log/README.md
+target/
