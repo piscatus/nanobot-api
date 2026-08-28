@@ -26,6 +26,10 @@ public class QueueEntity extends BaseEntity {
 
   private String seed;
 
+  private Long index;
+
+  private String privateKey;
+
   private Date timestamp;
 
   private String transactionId;
@@ -45,6 +49,8 @@ public class QueueEntity extends BaseEntity {
     this.ticker = queue.getTicker();
     this.processed = queue.getProcessed();
     this.seed = queue.getSeed();
+    this.index = queue.getIndex();
+    this.privateKey = queue.getPrivateKey();
     this.timestamp = queue.getTimestamp();
     this.transactionId = queue.getTransactionId();
   }
@@ -127,6 +133,22 @@ public class QueueEntity extends BaseEntity {
 
   public void setSeed(String seed) {
     this.seed = seed;
+  }
+
+  public Long getIndex() {
+    return index;
+  }
+
+  public void setIndex(Long index) {
+    this.index = index;
+  }
+
+  public String getPrivateKey() {
+    return privateKey;
+  }
+
+  public void setPrivateKey(String privateKey) {
+    this.privateKey = privateKey;
   }
 
   public Date getTimestamp() {

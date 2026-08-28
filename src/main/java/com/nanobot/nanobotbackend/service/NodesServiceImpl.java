@@ -178,8 +178,8 @@ public class NodesServiceImpl implements NodesService {
     }
 
     //this is the consolidation account, the hot wallet
-    String botUserAddress = CryptoUtil.deriveAddressFromSeed(
-      botUserSeed,
+    String botUserAddress = CryptoUtil.deriveAddress(
+      botUserDetails,
       currencyTicker
     );
 
@@ -236,9 +236,7 @@ public class NodesServiceImpl implements NodesService {
       )
     );
 
-    // get the private key from the seed
-    byte[] seedBytes = hexStringToByteArray(queueEntity.getSeed());
-    byte[] privateKey = derivePrivateKey(seedBytes, 0);
+    byte[] privateKey = resolveSigningKey(queueEntity);
 
     // send create block request
     JSONObject createBlockResponse = getResponseFromNode(
@@ -553,9 +551,7 @@ public class NodesServiceImpl implements NodesService {
       )
     );
 
-    // get the private key from the seed
-    byte[] seedBytes = hexStringToByteArray(queueEntity.getSeed());
-    byte[] privateKey = derivePrivateKey(seedBytes, 0);
+    byte[] privateKey = resolveSigningKey(queueEntity);
 
     // send create block request
     JSONObject createBlockResponse = getResponseFromNode(
@@ -726,8 +722,7 @@ public class NodesServiceImpl implements NodesService {
     String difficulty;
 
     // 2. Derive private key
-    byte[] seedBytes = hexStringToByteArray(queueEntity.getSeed());
-    byte[] privateKey = derivePrivateKey(seedBytes, 0);
+    byte[] privateKey = resolveSigningKey(queueEntity);
 
     // 3. Determine if account exists
     if (
@@ -774,10 +769,7 @@ public class NodesServiceImpl implements NodesService {
         "representative",
         response.has("representative")
           ? response.getString("representative")
-          : CryptoUtil.deriveAddressFromSeed(
-            queueEntity.getSeed(),
-            queueEntity.getTicker()
-          )
+          : queueEntity.getTargetAddress()
       )
       .put("link", queueEntity.getBlockHash()) // pending send block
       .put("previous", previous) // always include previous
@@ -1025,12 +1017,17 @@ public class NodesServiceImpl implements NodesService {
     Map<String, UserDetailsEntity> addressMap = new HashMap<>();
 
     for (UserDetailsEntity userDetails : allUserDetails) {
-      if (userDetails.getSeed() == null) {
+      if (
+        !CryptoUtil.canResolvePrivateKey(
+          userDetails.getSeed(),
+          userDetails.getPrivateKey()
+        )
+      ) {
         continue;
       }
 
-      String address = CryptoUtil.deriveAddressFromSeed(
-        userDetails.getSeed(),
+      String address = CryptoUtil.deriveAddress(
+        userDetails,
         currencyEntity.getTicker()
       );
       addressMap.put(address, userDetails);
@@ -1327,6 +1324,12 @@ public class NodesServiceImpl implements NodesService {
     return sb.toString();
   }
 
+  private byte[] resolveSigningKey(QueueEntity queueEntity) {
+    return hexStringToByteArray(
+      CryptoUtil.resolvePrivateKey(queueEntity).toString()
+    );
+  }
+
   public static byte[] derivePrivateKey(byte[] seed, int index) {
     byte[] indexBytes = ByteBuffer.allocate(4).putInt(index).array(); // big-endian
     byte[] data = new byte[seed.length + 4];
@@ -1400,6 +1403,10 @@ public class NodesServiceImpl implements NodesService {
               new java.util.Date(),
               null
             );
+            CryptoUtil.applySigningMaterial(
+              newQueue,
+              addressMap.get(account)
+            );
 
             queuesService.createQueue(newQueue);
 
@@ -1467,25 +1474,25 @@ public class NodesServiceImpl implements NodesService {
             "Receivable transaction has been confirmed on the network, adding to queue."
           );
 
-          queuesService.createQueue(
-            new QueueDto(
-              addressMap.get(account).equals(botUserId)
-                ? null
-                : addressMap.get(account).getUserId(),
-              response.getString("block_account"),
-              account,
-              LevelDto.RECEIVE,
-              hash,
-              response.getString("amount"),
-              ticker,
-              false,
-              addressMap.get(account).equals(botUserId)
-                ? botUserSeed
-                : addressMap.get(account).getSeed(),
-              new java.util.Date(),
-              null
-            )
+          UserDetailsEntity matchedUser = addressMap.get(account);
+          boolean isBotUser =
+            matchedUser.getUserId() != null &&
+            matchedUser.getUserId().equals(botUserId);
+          QueueDto receiveQueue = new QueueDto(
+            isBotUser ? null : matchedUser.getUserId(),
+            response.getString("block_account"),
+            account,
+            LevelDto.RECEIVE,
+            hash,
+            response.getString("amount"),
+            ticker,
+            false,
+            isBotUser ? botUserSeed : matchedUser.getSeed(),
+            new java.util.Date(),
+            null
           );
+          CryptoUtil.applySigningMaterial(receiveQueue, matchedUser);
+          queuesService.createQueue(receiveQueue);
 
           fileLogger.info(
             "Added transaction " +

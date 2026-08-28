@@ -24,6 +24,8 @@ class QueueDtoTest {
     entity.setTicker("NANO");
     entity.setProcessed(true);
     entity.setSeed("seed");
+    entity.setIndex(5L);
+    entity.setPrivateKey("queue-pk");
     entity.setTimestamp(ts);
     entity.setTransactionId("tx-1");
 
@@ -39,6 +41,8 @@ class QueueDtoTest {
     assertEquals("NANO", dto.getTicker());
     assertEquals(true, dto.getProcessed());
     assertEquals("seed", dto.getSeed());
+    assertEquals(5L, dto.getIndex());
+    assertEquals("queue-pk", dto.getPrivateKey());
     assertEquals(ts, dto.getTimestamp());
     assertEquals("tx-1", dto.getTransactionId());
   }
@@ -67,8 +71,12 @@ class QueueDtoTest {
     QueueDto dto = new QueueDto("u1", "src", "tgt", LevelDto.RECEIVE, "h", "r", "NANO", false, "s", new Date(), "tx-1");
     dto.setUserId("u2");
     dto.setTransactionId("tx-2");
+    dto.setIndex(8L);
+    dto.setPrivateKey("pk-2");
 
     assertEquals("u2", dto.getUserId());
     assertEquals("tx-2", dto.getTransactionId());
+    assertEquals(8L, dto.getIndex());
+    assertEquals("pk-2", dto.getPrivateKey());
   }
 }

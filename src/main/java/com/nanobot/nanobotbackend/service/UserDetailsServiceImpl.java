@@ -65,7 +65,7 @@ public class UserDetailsServiceImpl implements UserDetailsService {
         addresses.add(
           new WalletDto(
             ticker,
-            CryptoUtil.deriveAddressFromSeed(userDetails.getSeed(), ticker),
+            CryptoUtil.deriveAddress(userDetails, ticker),
             currencyDto.getName()
           )
         );
@@ -201,6 +201,8 @@ public class UserDetailsServiceImpl implements UserDetailsService {
           UserDetailsEntity user = userOptional.get();
           user.setStatus(userDetailsDto.getStatus());
           user.setSeed(userDetailsDto.getSeed());
+          user.setIndex(userDetailsDto.getIndex());
+          user.setPrivateKey(userDetailsDto.getPrivateKey());
           user.setUserId(userDetailsDto.getUserId());
           user.setSubordinateUserId(userDetailsDto.getSubordinateUserId());
 
