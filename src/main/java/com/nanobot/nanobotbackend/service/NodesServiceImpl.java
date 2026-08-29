@@ -63,8 +63,11 @@ public class NodesServiceImpl implements NodesService {
   private static final String BALANCE_RESPONSE_KEY = "balance";
   private static final String CONFIRMED_RESPONSE_KEY = "confirmed";
   private static final String BLOCK_COUNT_ACTION = "block_count";
+  private static final String TELEMETRY_ACTION = "telemetry";
   private static final String BLOCK_INFORMATION_ACTION = "block_info";
   private static final String ACTION_COMMAND = "action";
+  private static final int MAX_TELEMETRY_LAG = 50;
+  private static final int MIN_TELEMETRY_PEERS = 3;
 
   @Autowired
   public NodesServiceImpl(
@@ -1258,7 +1261,13 @@ public class NodesServiceImpl implements NodesService {
           );
           return true;
         } else if (BLOCK_COUNT_ACTION.equals(action)) {
-          return processBlockCount(responseJson);
+          JSONObject telemetryJson = getResponseFromNode(
+            currency.getNodeUrl(),
+            new JSONObject()
+              .put(ACTION_COMMAND, TELEMETRY_ACTION)
+              .put("raw", true)
+          );
+          return processBlockCount(responseJson, telemetryJson);
         }
       } catch (JSONException e) {
         fileLogger.error(
@@ -1277,36 +1286,82 @@ public class NodesServiceImpl implements NodesService {
     return false;
   }
 
-  public boolean processBlockCount(JSONObject responseJson) {
+  public boolean processBlockCount(
+    JSONObject responseJson,
+    JSONObject telemetryJson
+  ) {
     try {
-      int uncheckedBlocks = responseJson.getInt("unchecked");
-      int cementedBlocks = responseJson.getInt("cemented");
-      int totalCount = responseJson.getInt("count");
+      long localCount = responseJson.getLong("count");
+      long localCemented = responseJson.getLong("cemented");
 
-      // 1. Check for hard cementation stalls (like your current Banano node issue)
-      // If the node knows about blocks but is lagging behind by a severe margin (e.g., > 50 blocks)
-      int synchronizationLag = totalCount - cementedBlocks;
-      if (synchronizationLag > 50) {
+      if (telemetryJson == null || !telemetryJson.has("metrics")) {
         fileLogger.warn(
-          "Node is falling behind. Uncemented block lag: " + synchronizationLag
+          "Node telemetry is unavailable; cannot verify sync against peers"
         );
         return false;
       }
 
-      // 2. Node is at the tip of its known ledger
-      // (Note: To catch the "isolated node" edge case completely, you'll eventually want
-      // to compare totalCount against an external telemetry avg or public explorer RPC)
-      if (totalCount <= cementedBlocks) {
-        // Node has cemented everything it currently knows about
-        return true;
+      JSONArray metrics = telemetryJson.getJSONArray("metrics");
+      List<Long> peerCounts = new ArrayList<>();
+      List<Long> peerCemented = new ArrayList<>();
+      for (int i = 0; i < metrics.length(); i++) {
+        JSONObject metric = metrics.getJSONObject(i);
+        if (!metric.has("block_count") || !metric.has("cemented_count")) {
+          continue;
+        }
+        long peerCount = metric.getLong("block_count");
+        long peerCementedCount = metric.getLong("cemented_count");
+        if (peerCount <= 0) {
+          continue;
+        }
+        peerCounts.add(peerCount);
+        peerCemented.add(peerCementedCount);
       }
 
-      // Catch-all: Node is actively catching up a tiny, acceptable gap
+      if (peerCounts.size() < MIN_TELEMETRY_PEERS) {
+        fileLogger.warn(
+          "Not enough peer telemetry samples to verify sync: " +
+          peerCounts.size()
+        );
+        return false;
+      }
+
+      long medianCount = median(peerCounts);
+      long medianCemented = median(peerCemented);
+      long countLag = medianCount - localCount;
+      long cementedLag = medianCemented - localCemented;
+
+      if (countLag > MAX_TELEMETRY_LAG || cementedLag > MAX_TELEMETRY_LAG) {
+        fileLogger.warn(
+          "Node is falling behind peers. Block count lag: " +
+          countLag +
+          ", cemented lag: " +
+          cementedLag +
+          " (peer median count=" +
+          medianCount +
+          ", cemented=" +
+          medianCemented +
+          ")"
+        );
+        return false;
+      }
       return true;
     } catch (JSONException e) {
-      fileLogger.error("Failed to parse block count JSON: " + e.getMessage());
+      fileLogger.error(
+        "Failed to parse block count or telemetry JSON: " + e.getMessage()
+      );
       return false;
     }
+  }
+
+  static long median(List<Long> values) {
+    List<Long> sorted = new ArrayList<>(values);
+    Collections.sort(sorted);
+    int size = sorted.size();
+    if (size % 2 == 1) {
+      return sorted.get(size / 2);
+    }
+    return (sorted.get(size / 2 - 1) + sorted.get(size / 2)) / 2;
   }
 
   public static byte[] hexStringToByteArray(String s) {
