@@ -11,6 +11,7 @@ import com.nanobot.nanobotbackend.entity.QueueEntity;
 import java.util.Arrays;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.jupiter.api.AfterEach;
@@ -123,49 +124,196 @@ class NodesServiceImplTest {
   }
 
   @Test
-  void processBlockCountShouldReturnTrueWhenNodeHealthy() throws JSONException {
-    JSONObject response = new JSONObject();
-    response.put("unchecked", 0);
-    response.put("cemented", 100);
-    response.put("count", 100);
+  void processBlockCountShouldReturnTrueWhenInLineWithPeers()
+    throws JSONException {
+    JSONObject response = blockCount(222_510_100L, 222_471_100L);
+    JSONObject telemetry = peerTelemetry(
+      new long[] { 222_510_090L, 222_510_120L, 222_510_110L },
+      new long[] { 222_471_090L, 222_471_120L, 222_471_110L }
+    );
 
-    boolean result = nodesService.processBlockCount(response);
-
-    assertTrue(result);
+    assertTrue(nodesService.processBlockCount(response, telemetry));
   }
 
   @Test
-  void processBlockCountShouldReturnTrueWhenSyncing() throws JSONException {
-    JSONObject response = new JSONObject();
-    response.put("unchecked", 50);
-    response.put("cemented", 90);
-    response.put("count", 100);
+  void processBlockCountShouldReturnTrueWhenLocalUnconfirmedGapMatchesNetwork()
+    throws JSONException {
+    // ~39k unconfirmed locally, same as peers — not actually behind
+    JSONObject response = blockCount(222_510_100L, 222_471_100L);
+    JSONObject telemetry = peerTelemetry(
+      new long[] {
+        222_510_080L,
+        222_510_100L,
+        222_510_120L,
+        222_510_095L,
+        222_510_105L
+      },
+      new long[] {
+        222_471_080L,
+        222_471_100L,
+        222_471_120L,
+        222_471_095L,
+        222_471_105L
+      }
+    );
 
-    boolean result = nodesService.processBlockCount(response);
-
-    assertTrue(result);
+    assertTrue(nodesService.processBlockCount(response, telemetry));
   }
 
   @Test
-  void processBlockCountShouldReturnFalseWhenTooManyUnchecked() throws JSONException {
-    JSONObject response = new JSONObject();
-    response.put("unchecked", 150);
-    response.put("cemented", 100);
-    response.put("count", 250);
+  void processBlockCountShouldReturnFalseWhenCementedLagsPeers()
+    throws JSONException {
+    JSONObject response = blockCount(222_510_100L, 222_470_000L);
+    JSONObject telemetry = peerTelemetry(
+      new long[] { 222_510_100L, 222_510_110L, 222_510_120L },
+      new long[] { 222_471_100L, 222_471_110L, 222_471_120L }
+    );
 
-    boolean result = nodesService.processBlockCount(response);
+    assertFalse(nodesService.processBlockCount(response, telemetry));
+  }
 
-    assertFalse(result);
+  @Test
+  void processBlockCountShouldReturnFalseWhenBlockCountLagsPeers()
+    throws JSONException {
+    JSONObject response = blockCount(222_509_000L, 222_471_100L);
+    JSONObject telemetry = peerTelemetry(
+      new long[] { 222_510_100L, 222_510_110L, 222_510_120L },
+      new long[] { 222_471_100L, 222_471_110L, 222_471_120L }
+    );
+
+    assertFalse(nodesService.processBlockCount(response, telemetry));
+  }
+
+  @Test
+  void processBlockCountShouldReturnFalseWhenTelemetryMissing()
+    throws JSONException {
+    JSONObject response = blockCount(100L, 100L);
+
+    assertFalse(nodesService.processBlockCount(response, null));
+    assertFalse(nodesService.processBlockCount(response, new JSONObject()));
+  }
+
+  @Test
+  void processBlockCountShouldReturnFalseWhenTooFewPeers() throws JSONException {
+    JSONObject response = blockCount(100L, 100L);
+    JSONObject telemetry = peerTelemetry(
+      new long[] { 100L, 100L },
+      new long[] { 100L, 100L }
+    );
+
+    assertFalse(nodesService.processBlockCount(response, telemetry));
   }
 
   @Test
   void processBlockCountShouldReturnFalseWhenInvalidJson() throws JSONException {
     JSONObject response = new JSONObject();
     response.put("invalid", "data");
+    JSONObject telemetry = peerTelemetry(
+      new long[] { 100L, 100L, 100L },
+      new long[] { 100L, 100L, 100L }
+    );
 
-    boolean result = nodesService.processBlockCount(response);
+    assertFalse(nodesService.processBlockCount(response, telemetry));
+  }
 
-    assertFalse(result);
+  @Test
+  void processBlockCountShouldIgnoreBrokenPeerSamples() throws JSONException {
+    JSONObject response = blockCount(100L, 100L);
+    JSONArray metrics = new JSONArray();
+    metrics.put(new JSONObject().put("block_count", 1).put("cemented_count", 1));
+    metrics.put(
+      new JSONObject().put("block_count", 100).put("cemented_count", 100)
+    );
+    metrics.put(
+      new JSONObject().put("block_count", 100).put("cemented_count", 100)
+    );
+    metrics.put(
+      new JSONObject().put("block_count", 101).put("cemented_count", 100)
+    );
+    metrics.put(new JSONObject().put("block_count", 0).put("cemented_count", 0));
+    JSONObject telemetry = new JSONObject().put("metrics", metrics);
+
+    assertTrue(nodesService.processBlockCount(response, telemetry));
+  }
+
+  @Test
+  void processBlockCountShouldReturnTrueWhenAllBlocksCemented()
+    throws JSONException {
+    JSONObject response = blockCount(100L, 100L);
+    JSONObject telemetry = peerTelemetry(
+      new long[] { 100L, 100L, 101L },
+      new long[] { 100L, 100L, 100L }
+    );
+
+    assertTrue(nodesService.processBlockCount(response, telemetry));
+  }
+
+  @Test
+  void sendRequestToNodeShouldAcceptBlockCountWhenTelemetryShowsNodeInSync()
+    throws Exception {
+    mockWebServer = new MockWebServer();
+    mockWebServer.start();
+    String baseUrl = mockWebServer.url("/").toString();
+
+    mockWebServer.enqueue(
+      new MockResponse()
+        .setBody("{\"count\":\"100\",\"cemented\":\"100\",\"unchecked\":\"0\"}")
+    );
+    mockWebServer.enqueue(
+      new MockResponse()
+        .setBody(
+          peerTelemetry(
+            new long[] { 100L, 100L, 100L },
+            new long[] { 100L, 100L, 100L }
+          ).toString()
+        )
+    );
+
+    CurrencyEntity currency = new CurrencyEntity();
+    currency.setNodeUrl(baseUrl);
+
+    NodesServiceImpl serviceWithMock = new NodesServiceImpl(
+      currenciesService,
+      messagesService,
+      queuesService,
+      coreServices,
+      transactionsService,
+      java.net.http.HttpClient.newHttpClient(),
+      baseUrl
+    );
+
+    boolean result = serviceWithMock.sendRequestToNode(
+      null,
+      null,
+      null,
+      currency,
+      "block_count",
+      new JSONObject().put("action", "block_count")
+    );
+
+    assertTrue(result);
+    assertEquals(2, mockWebServer.getRequestCount());
+  }
+
+  private static JSONObject blockCount(long count, long cemented)
+    throws JSONException {
+    return new JSONObject()
+      .put("unchecked", 0)
+      .put("count", count)
+      .put("cemented", cemented);
+  }
+
+  private static JSONObject peerTelemetry(long[] counts, long[] cemented)
+    throws JSONException {
+    JSONArray metrics = new JSONArray();
+    for (int i = 0; i < counts.length; i++) {
+      metrics.put(
+        new JSONObject()
+          .put("block_count", counts[i])
+          .put("cemented_count", cemented[i])
+      );
+    }
+    return new JSONObject().put("metrics", metrics);
   }
 
   @Test
@@ -186,18 +334,6 @@ class NodesServiceImplTest {
     byte[] result = NodesServiceImpl.addressToPublicKey(currency, validAddress);
     assertNotNull(result);
     assertEquals(32, result.length);
-  }
-
-  @Test
-  void processBlockCountShouldReturnTrueWhenAllBlocksCemented() throws JSONException {
-    JSONObject response = new JSONObject();
-    response.put("unchecked", 0);
-    response.put("cemented", 100);
-    response.put("count", 100);
-
-    boolean result = nodesService.processBlockCount(response);
-
-    assertTrue(result);
   }
 
   @Test
