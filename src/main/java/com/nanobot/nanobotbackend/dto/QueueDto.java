@@ -23,6 +23,10 @@ public class QueueDto extends BaseDto {
 
   private String seed;
 
+  private Long index;
+
+  private String privateKey;
+
   private Date timestamp;
 
   private String transactionId;
@@ -38,6 +42,8 @@ public class QueueDto extends BaseDto {
     this.ticker = entity.getTicker();
     this.processed = entity.getProcessed();
     this.seed = entity.getSeed();
+    this.index = entity.getIndex();
+    this.privateKey = entity.getPrivateKey();
     this.timestamp = entity.getTimestamp();
     this.transactionId = entity.getTransactionId();
   }
@@ -147,6 +153,22 @@ public class QueueDto extends BaseDto {
 
   public void setSeed(String seed) {
     this.seed = seed;
+  }
+
+  public Long getIndex() {
+    return index;
+  }
+
+  public void setIndex(Long index) {
+    this.index = index;
+  }
+
+  public String getPrivateKey() {
+    return privateKey;
+  }
+
+  public void setPrivateKey(String privateKey) {
+    this.privateKey = privateKey;
   }
 
   public Date getTimestamp() {

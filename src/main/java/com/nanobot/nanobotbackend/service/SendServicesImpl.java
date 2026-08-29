@@ -140,8 +140,8 @@ public class SendServicesImpl implements SendServices {
             }
 
             UserDetailsEntity userDetails = userDetailsOptional.get();
-            String userAddress = CryptoUtil.deriveAddressFromSeed(
-              userDetails.getSeed(),
+            String userAddress = CryptoUtil.deriveAddress(
+              userDetails,
               currencyDto.getTicker()
             );
             isValidAddress = true;
@@ -158,6 +158,7 @@ public class SendServicesImpl implements SendServices {
               new Date(),
               null
             );
+            CryptoUtil.applySigningMaterial(queueDto, userDetails);
 
             QueueEntity queueEntity = queuesService.createQueue(queueDto);
             // Check that it was added successfully
@@ -319,8 +320,8 @@ public class SendServicesImpl implements SendServices {
                     .orElse(null);
                   QueueDto queueDto = new QueueDto(
                     requestDto.getUserId(),
-                    CryptoUtil.deriveAddressFromSeed(
-                      botUserDetails.getSeed(),
+                    CryptoUtil.deriveAddress(
+                      botUserDetails,
                       transferDto.getWallets().get(0).getTicker()
                     ),
                     requestDto.getAddress(),
@@ -333,6 +334,7 @@ public class SendServicesImpl implements SendServices {
                     new Date(),
                     transfer.getTransactionId()
                   );
+                  CryptoUtil.applySigningMaterial(queueDto, botUserDetails);
                   QueueEntity queueEntity = queuesService.createQueue(queueDto);
                   // Check that it was added successfully
 

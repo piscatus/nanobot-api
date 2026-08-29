@@ -8,6 +8,10 @@ public class UserDetailsDto extends BaseDto {
 
   private String seed;
 
+  private Long index;
+
+  private String privateKey;
+
   private String userId;
 
   private String subordinateUserId;
@@ -33,6 +37,8 @@ public class UserDetailsDto extends BaseDto {
     super(entity.getId());
     this.status = entity.getStatus();
     this.seed = entity.getSeed();
+    this.index = entity.getIndex();
+    this.privateKey = entity.getPrivateKey();
     this.userId = entity.getUserId();
     this.subordinateUserId = entity.getSubordinateUserId();
   }
@@ -53,6 +59,22 @@ public class UserDetailsDto extends BaseDto {
     this.seed = seed;
   }
 
+  public Long getIndex() {
+    return index;
+  }
+
+  public void setIndex(Long index) {
+    this.index = index;
+  }
+
+  public String getPrivateKey() {
+    return privateKey;
+  }
+
+  public void setPrivateKey(String privateKey) {
+    this.privateKey = privateKey;
+  }
+
   public String getUserId() {
     return userId;
   }
@@ -71,5 +93,6 @@ public class UserDetailsDto extends BaseDto {
 
   public void removeSensitiveData() {
     this.seed = null;
+    this.privateKey = null;
   }
 }
