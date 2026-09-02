@@ -6,6 +6,8 @@ import com.nanobot.nanobotbackend.dto.UserDetailsDto;
 import com.nanobot.nanobotbackend.dto.WalletDto;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;
 import com.nanobot.nanobotbackend.repository.UserDetailsRepository;
+import com.nanobot.nanobotbackend.service.chain.DepositAddressResolver;
+import com.nanobot.nanobotbackend.util.CryptoUtil;
 import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
@@ -23,8 +25,21 @@ class UserDetailsServiceImplTest {
   @Mock
   private UserDetailsRepository userDetailsRepositoryMock;
 
+  @Mock
+  private DepositAddressResolver depositAddressResolverMock;
+
   public UserDetailsServiceImplTest() {
     MockitoAnnotations.openMocks(this);
+    // Address generation now goes through the chain adapter. For Nano the
+    // adapter derives from the user's seed, so delegate to the same helper it
+    // uses and keep these tests covering the derivation rules.
+    when(depositAddressResolverMock.resolve(any(UserDetailsDto.class), anyString()))
+      .thenAnswer(invocation ->
+        CryptoUtil.deriveAddress(
+          (UserDetailsDto) invocation.getArgument(0),
+          invocation.getArgument(1)
+        )
+      );
   }
 
   @Test
@@ -70,6 +85,61 @@ class UserDetailsServiceImplTest {
     assertEquals(
       address2.getAddress(), 
       "ban_3nesn4knc35xzeizidwxoxmatirmytcc3crctax8k5uy6fqi9xzxnqcmgizq"
+    );
+  }
+
+  @Test
+  void generateAddressesUsesCustomIndex() {
+    String seed =
+      "3D1B8B0003EEEB65C4782D24231A3EEA8A795E2CAFA1B86EFEBB82255CFEC224";
+    UserDetailsDto mockDto = new UserDetailsDto();
+    mockDto.setSeed(seed);
+    mockDto.setIndex(1L);
+
+    List<WalletDto> addresses = userDetailsService.generateAddresses(
+      List.of(new CurrencyDto("XNO", "Nano", true)),
+      mockDto
+    );
+
+    assertEquals(1, addresses.size());
+    assertNotEquals(
+      "nano_3nesn4knc35xzeizidwxoxmatirmytcc3crctax8k5uy6fqi9xzxnqcmgizq",
+      addresses.get(0).getAddress()
+    );
+    assertEquals(
+      CryptoUtil.deriveAddress(seed, 1L, null, "XNO"),
+      addresses.get(0).getAddress()
+    );
+  }
+
+  @Test
+  void generateAddressesPrefersPrivateKeyOverSeedAndIndex() {
+    String seed =
+      "3D1B8B0003EEEB65C4782D24231A3EEA8A795E2CAFA1B86EFEBB82255CFEC224";
+    String privateKey =
+      "0000000000000000000000000000000000000000000000000000000000000002";
+    UserDetailsDto mockDto = new UserDetailsDto();
+    mockDto.setSeed(seed);
+    mockDto.setIndex(1L);
+    mockDto.setPrivateKey(privateKey);
+
+    List<WalletDto> addresses = userDetailsService.generateAddresses(
+      List.of(
+        new CurrencyDto("XNO", "Nano", true),
+        new CurrencyDto("BAN", "Banano", true)
+      ),
+      mockDto
+    );
+
+    String expectedNano = CryptoUtil.deriveAddress(null, null, privateKey, "XNO");
+    assertEquals(expectedNano, addresses.get(0).getAddress());
+    assertEquals(
+      expectedNano.replace("nano", "ban"),
+      addresses.get(1).getAddress()
+    );
+    assertNotEquals(
+      "nano_3nesn4knc35xzeizidwxoxmatirmytcc3crctax8k5uy6fqi9xzxnqcmgizq",
+      addresses.get(0).getAddress()
     );
   }
 
@@ -233,6 +303,8 @@ class UserDetailsServiceImplTest {
       UserDetailsDto updatedDto = new UserDetailsDto();
       updatedDto.setUserId("newUser");
       updatedDto.setSeed("newSeed");
+      updatedDto.setIndex(12L);
+      updatedDto.setPrivateKey("newPk");
       updatedDto.setStatus(StatusDto.ACTIVE);
       updatedDto.setSubordinateUserId("sub999");
 
@@ -246,6 +318,8 @@ class UserDetailsServiceImplTest {
       assertTrue(updated.isPresent());
       assertEquals("newUser", updated.get().getUserId());
       assertEquals("newSeed", updated.get().getSeed());
+      assertEquals(12L, updated.get().getIndex());
+      assertEquals("newPk", updated.get().getPrivateKey());
       assertEquals(StatusDto.ACTIVE, updated.get().getStatus());
   }
 

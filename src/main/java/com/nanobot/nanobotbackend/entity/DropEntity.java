@@ -31,6 +31,10 @@ public class DropEntity extends BaseEntity {
 
   private String userId;
 
+  /** Creator's display name, so the closing embed can name them even when a
+   * mention renders as a raw id for uncached members. */
+  private String username;
+
   private Date startTime;
 
   private TransferDto transfer;
@@ -56,6 +60,7 @@ public class DropEntity extends BaseEntity {
     this.startTime = drop.getStartTime();
     this.transfer = drop.getTransfer();
     this.userId = drop.getUserId();
+    this.username = drop.getUsername();
   }
 
   public String getChannelId() {
@@ -160,5 +165,13 @@ public class DropEntity extends BaseEntity {
 
   public void setUserId(String userId) {
     this.userId = userId;
+  }
+
+  public String getUsername() {
+    return username;
+  }
+
+  public void setUsername(String username) {
+    this.username = username;
   }
 }

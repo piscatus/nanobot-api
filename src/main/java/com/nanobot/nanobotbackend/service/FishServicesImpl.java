@@ -20,7 +20,9 @@ import com.nanobot.nanobotbackend.util.TimeUtil;
 import java.math.BigInteger;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -30,12 +32,18 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class FishServicesImpl implements FishServices {
+
+  /**
+   * A catch debits the guild reserve twice the creature's value, because
+   * selling the creature back pays the user twice that value.
+   */
+  private static final BigInteger RESERVE_MULTIPLIER = BigInteger.valueOf(2L);
+
+  private static final int DEFAULT_FISHING_FREQUENCY_MINUTES = 15;
 
   public final CoreServices coreServices;
 
@@ -122,93 +130,24 @@ public class FishServicesImpl implements FishServices {
 
       transferResponseDto.setBonuses(new BonusesDto().getBonuses());
 
-      String requiredFishingRole = null;
-      if (
-        transferResponseDto.getGuildConfigurations().getFishingRole() != null
-      ) {
-        requiredFishingRole = transferResponseDto
-          .getGuildConfigurations()
-          .getFishingRole();
-      }
-
-      List<String> requiredFishingBypassRoles = null;
-      if (
-        transferResponseDto.getGuildConfigurations().getFishingBypassRoles() !=
-        null
-      ) {
-        requiredFishingBypassRoles = transferResponseDto
-          .getGuildConfigurations()
-          .getFishingBypassRoles();
-      }
-
-      String requiredFishingRoleMessage = null;
-      if (
-        transferResponseDto.getGuildConfigurations().getFishingError() != null
-      ) {
-        requiredFishingRoleMessage = transferResponseDto
-          .getGuildConfigurations()
-          .getFishingError();
-      }
-
-      if (
-        requiredFishingRole != null &&
-        !requiredFishingRole.equals("") &&
-        !requiredFishingRole.equals("0") &&
-        !requestDto.getUserRoles().contains(requiredFishingRole) &&
-        (requiredFishingBypassRoles == null ||
-          !requestDto
-            .getUserRoles()
-            .stream()
-            .anyMatch(requiredFishingBypassRoles::contains))
-      ) {
-        String errorMessage =
-          "<@" +
-          requestDto.getUserId() +
-          "> does not currently hold the required role (<@&" +
-          requiredFishingRole +
-          ">) for fishing.";
-
-        if (
-          requiredFishingRoleMessage != null &&
-          !requiredFishingRoleMessage.isEmpty()
-        ) {
-          errorMessage +=
-            "\n\n**Server Message:** " + requiredFishingRoleMessage;
-        }
-
-        transferResponseDto.setErrorMessage(errorMessage);
-
+      String roleError = findRoleError(requestDto, transferResponseDto);
+      if (roleError != null) {
+        transferResponseDto.setErrorMessage(roleError);
         return transferResponseDto;
       }
 
       final String botUserId = System.getenv("BOT_USER_ID");
-
-      String brokeAssBitch =
-        "<@" +
-        requestDto.getUserId() +
-        "> cannot fish because the server balance does not meet the minimum requirement.\n" +
-        "Any user can </" +
-        Constants.COMMAND_NAME_GIFT +
-        ":" +
-        commandMap.get(Constants.COMMAND_NAME_GIFT) +
-        "> <@" +
-        botUserId +
-        "> from within a server to contriubute to that server's fishing </" +
-        Constants.COMMAND_NAME_RESERVES +
-        ":" +
-        commandMap.get(Constants.COMMAND_NAME_RESERVES) +
-        ">!\n" +
-        "See </" +
-        Constants.COMMAND_NAME_HELP +
-        ":" +
-        commandMap.get(Constants.COMMAND_NAME_HELP) +
-        "> for more information!";
+      final String emptyReservesError = formatEmptyReservesError(
+        requestDto.getUserId(),
+        botUserId,
+        commandMap
+      );
 
       // Server Balances
       List<GuildWalletsEntity> guildWalletsList =
         guildWalletsService.getGuildsWallets(requestDto.getGuildId());
       if (guildWalletsList.isEmpty()) {
-        transferResponseDto.setErrorMessage(brokeAssBitch);
+        transferResponseDto.setErrorMessage(emptyReservesError);
         return transferResponseDto;
       }
       GuildWalletsDto guildWalletDto = new GuildWalletsDto(
@@ -216,68 +155,49 @@ public class FishServicesImpl implements FishServices {
       );
       List<WalletDto> guildWallet = guildWalletDto.getWallets();
 
-      // Creature Values
-      List<CreatureEntity> creaturesEntities = creaturesService.getCreatures();
-      List<CreatureDto> creatures = new ArrayList<>();
-      Map<String, BigInteger> maxCreatureValuesByTicker = new HashMap<>();
+      // Creatures whose currency is still enabled, and the priciest catch per ticker
+      List<CreatureDto> stockedCreatures = findStockedCreatures(
+        creaturesService.getCreatures(),
+        transferResponseDto.getCurrencies()
+      );
+      Map<String, BigInteger> maxCreatureValuesByTicker =
+        findMaxCreatureValuesByTicker(stockedCreatures);
 
-      // Step 1: Build a Map of ticker to currency enabled status
-      Map<String, Boolean> currencyEnabledMap = transferResponseDto
-        .getCurrencies()
-        .stream()
-        .collect(
-          Collectors.toMap(CurrencyDto::getTicker, CurrencyDto::getEnabled)
-        );
-
-      // Step 2: Process creatures, skipping those with disabled currencies
-      for (CreatureEntity creatureEntity : creaturesEntities) {
-        String ticker = creatureEntity.getTicker();
-
-        // Skip this creature if its currency is disabled or missing
-        if (!Boolean.TRUE.equals(currencyEnabledMap.get(ticker))) {
-          continue;
-        }
-
-        CreatureDto creature = new CreatureDto(creatureEntity);
-        creatures.add(creature);
-
-        BigInteger creatureValue = new BigInteger(creature.getValue());
-
-        // Update the maximum creature value for this ticker
-        maxCreatureValuesByTicker.merge(ticker, creatureValue, BigInteger::max);
-      }
-
-      Set<String> affordableTickers = new HashSet<>();
-      Set<String> unaffordableTickers = new HashSet<>();
-
-      for (WalletDto wallet : guildWallet) {
-        String ticker = wallet.getTicker();
-        BigInteger walletBalance = new BigInteger(wallet.getRaw());
-
-        if (maxCreatureValuesByTicker.containsKey(ticker)) {
-          BigInteger doubleMaxCreatureValue = maxCreatureValuesByTicker
-            .get(ticker)
-            .multiply(BigInteger.valueOf(2));
-          if (walletBalance.compareTo(doubleMaxCreatureValue) >= 0) {
-            affordableTickers.add(ticker);
-          } else {
-            unaffordableTickers.add(ticker);
-          }
-        }
-      }
+      Set<String> affordableTickers = findAffordableTickers(
+        guildWallet,
+        maxCreatureValuesByTicker
+      );
 
       if (affordableTickers.isEmpty()) {
-        transferResponseDto.setErrorMessage(brokeAssBitch);
+        transferResponseDto.setErrorMessage(emptyReservesError);
         return transferResponseDto;
       }
 
-      creaturesEntities.removeIf(creature ->
-        !affordableTickers.contains(creature.getTicker())
-      );
+      // Optional currency filter, so a user can target one ticker's creatures
+      String requestedTicker = normalizeTicker(requestDto.getTicker());
+      if (requestedTicker != null) {
+        String tickerError = findRequestedTickerError(
+          requestedTicker,
+          maxCreatureValuesByTicker.keySet(),
+          affordableTickers,
+          requestDto.getUserId(),
+          botUserId,
+          commandMap,
+          transferResponseDto.getCurrencies()
+        );
+        if (tickerError != null) {
+          transferResponseDto.setErrorMessage(tickerError);
+          return transferResponseDto;
+        }
+      }
 
-      creatures.removeIf(creature ->
-        !affordableTickers.contains(creature.getTicker())
-      );
+      List<CreatureDto> catchPool = stockedCreatures
+        .stream()
+        .filter(creature -> affordableTickers.contains(creature.getTicker()))
+        .filter(creature ->
+          requestedTicker == null || requestedTicker.equals(creature.getTicker())
+        )
+        .toList();
 
       // Declare users item set
       Set<UserItemsEntity> currentUserItemQuantities = new HashSet<>();
@@ -287,165 +207,96 @@ public class FishServicesImpl implements FishServices {
         requestDto.getUserId()
       );
 
-      // Initialize sender items
       if (!senderItemsList.isEmpty()) {
         currentUserItemQuantities.add(senderItemsList.get(0));
-        List<ItemDto> userItems = senderItemsList.get(0).getItems();
-        for (ItemDto userItem : userItems) {
-          for (CreatureEntity creature : creaturesEntities) {
-            if (
-              userItem.getName().equalsIgnoreCase(creature.getName()) &&
-              userItem.getQuantity() >= creature.getCapacity()
-            ) {
-              transferResponseDto.setErrorMessage(
-                "<@" +
-                requestDto.getUserId() +
-                "> has one or more </" +
-                Constants.COMMAND_NAME_INVENTORY +
-                ":" +
-                commandMap.get(Constants.COMMAND_NAME_INVENTORY) +
-                "> items at or above maximum capacity!" +
-                "\n" +
-                "Convert inventory items into currencies with </" +
-                Constants.COMMAND_NAME_SELL +
-                ":" +
-                commandMap.get(Constants.COMMAND_NAME_SELL) +
-                ">!"
-              );
-              return transferResponseDto;
-            }
-          }
+
+        String capacityError = findCapacityError(
+          senderItemsList.get(0),
+          catchPool,
+          requestDto.getUserId(),
+          commandMap
+        );
+        if (capacityError != null) {
+          transferResponseDto.setErrorMessage(capacityError);
+          return transferResponseDto;
         }
       }
 
       // Call logCurrentItems() method before fishing
       LoggingUtil.logCurrentItems(currentUserItemQuantities);
 
-      // Get the guilds fishing time
-      Integer guildTime = (transferResponseDto
-              .getGuildConfigurations()
-              .getFishingFrequency() !=
-            null &&
-          transferResponseDto.getGuildConfigurations().getFishingFrequency() !=
-          0)
-        ? transferResponseDto.getGuildConfigurations().getFishingFrequency()
-        : 15;
+      String cooldownError = findCooldownError(
+        requestDto,
+        transferResponseDto,
+        commandMap
+      );
+      if (cooldownError != null) {
+        transferResponseDto.setErrorMessage(cooldownError);
+        return transferResponseDto;
+      }
 
-      // Get (and update) the users fish time
-      Optional<AnglerEntity> anglerTimestamp =
-        anglersService.getAnglerByGuildIdAndUserId(
-          requestDto.getGuildId(),
-          requestDto.getUserId()
+      CreatureDto creature = selectWeightedCreature(catchPool);
+
+      if (creature == null) {
+        transferResponseDto.setErrorMessage(
+          "<@" + requestDto.getUserId() + "> crashed their fishing boat."
         );
-      if (anglerTimestamp.isPresent()) {
-        AnglerEntity angler = anglerTimestamp.get();
-        Date timestamp = angler.getTimestamp();
-        long guildTimeInMillis = guildTime * 60 * 1000L;
-
-        // Get the timestamp in milliseconds and add guildTime
-        long timestampInMillis = timestamp.getTime();
-        long updatedTimestampInMillis = timestampInMillis + guildTimeInMillis;
-
-        // Get the current time in milliseconds
-        long currentTimeInMillis = System.currentTimeMillis();
-
-        // Calculate the remaining time (time left until currentTimeInMillis >= updatedTimestampInMillis)
-        long remaining = updatedTimestampInMillis - currentTimeInMillis;
-
-        if (remaining > 0) {
-          transferResponseDto.setErrorMessage(
-            "<@" +
-            requestDto.getUserId() +
-            "> must wait " +
-            TimeUtil.formatTimeRemaining(remaining) +
-            " to </" +
-            Constants.COMMAND_NAME_FISH +
-            ":" +
-            commandMap.get(Constants.COMMAND_NAME_FISH) +
-            "> again."
-          );
-
-          return transferResponseDto;
-        }
+        return transferResponseDto;
       }
 
-      // Calculate total odds
-      int totalOdds = 0;
-      for (CreatureDto creature : creatures) {
-        totalOdds += creature.getOdds();
-      }
-
-      // Pick a random number between 0 and total odds - 1
-      SecureRandom secureRand = new SecureRandom();
-      int rand = secureRand.nextInt(totalOdds);
-
-      // Loop through and find the selected creature
-      int cumulative = 0;
-      for (CreatureDto creature : creatures) {
-        cumulative += creature.getOdds();
-        if (rand < cumulative) {
-          transferResponseDto.setConfirmation(true);
-          transferResponseDto.setPrimaryTransfer(
-            new TransferDto(
-              Collections.singletonList(
-                new WalletDto(
-                  creature.getTicker(),
-                  (new BigInteger(creature.getValue()).multiply(
-                      BigInteger.valueOf(2L)
-                    )).toString(),
-                  true
-                )
-              ),
-              new ArrayList<>()
+      transferResponseDto.setConfirmation(true);
+      transferResponseDto.setPrimaryTransfer(
+        new TransferDto(
+          Collections.singletonList(
+            new WalletDto(
+              creature.getTicker(),
+              (new BigInteger(creature.getValue()).multiply(
+                  RESERVE_MULTIPLIER
+                )).toString(),
+              true
             )
-          );
-          transferResponseDto.setSecondaryTransfer(
-            new TransferDto(
-              new ArrayList<>(),
-              Collections.singletonList(
-                new ItemDto(creature.getName().toUpperCase(), 1, true)
-              )
-            )
-          );
-
-          TransferResponseDto transfer =
-            transferExecutorService.executeTransfer(
-              Constants.COMMAND_NAME_FISH,
-              requestDto.getGuildId(),
-              requestDto.getChannelId(),
-              botUserId,
-              "0",
-              Collections.singletonList("0"),
-              Collections.singletonList(requestDto.getUserId()),
-              transferResponseDto
-            );
-
-          if (transfer.getErrorMessage() != null) {
-            return transfer;
-          }
-
-          //set the fishing time
-          anglersService.updateOrCreateAngler(
-            requestDto.getGuildId(),
-            requestDto.getUserId()
-          );
-
-          // Leaderboard increment
-          leaderboardsService.incrementOrCreateLeaderboard(
-            requestDto.getGuildId(),
-            requestDto.getUserId(),
-            creature
-          );
-
-          return transfer;
-        }
-      }
-
-      transferResponseDto.setErrorMessage(
-        "<@" + requestDto.getUserId() + "> crashed their fishing boat."
+          ),
+          new ArrayList<>()
+        )
+      );
+      transferResponseDto.setSecondaryTransfer(
+        new TransferDto(
+          new ArrayList<>(),
+          Collections.singletonList(
+            new ItemDto(creature.getName().toUpperCase(), 1, true)
+          )
+        )
       );
 
-      return transferResponseDto;
+      TransferResponseDto transfer = transferExecutorService.executeTransfer(
+        Constants.COMMAND_NAME_FISH,
+        requestDto.getGuildId(),
+        requestDto.getChannelId(),
+        botUserId,
+        "0",
+        Collections.singletonList("0"),
+        Collections.singletonList(requestDto.getUserId()),
+        transferResponseDto
+      );
+
+      if (transfer.getErrorMessage() != null) {
+        return transfer;
+      }
+
+      //set the fishing time
+      anglersService.updateOrCreateAngler(
+        requestDto.getGuildId(),
+        requestDto.getUserId()
+      );
+
+      // Leaderboard increment
+      leaderboardsService.incrementOrCreateLeaderboard(
+        requestDto.getGuildId(),
+        requestDto.getUserId(),
+        creature
+      );
+
+      return transfer;
     } catch (Exception e) {
       LoggingUtil.errorLogging(Constants.COMMAND_NAME_FISH, e);
       return new TransferResponseDto(
@@ -455,5 +306,371 @@ public class FishServicesImpl implements FishServices {
         Constants.unknownError
       );
     }
+  }
+
+  /**
+   * Error when the guild gates fishing behind a role the user does not hold and
+   * cannot bypass, otherwise null.
+   */
+  private String findRoleError(
+    RequestDto requestDto,
+    TransferResponseDto transferResponseDto
+  ) {
+    String requiredFishingRole = transferResponseDto
+      .getGuildConfigurations()
+      .getFishingRole();
+
+    if (
+      requiredFishingRole == null ||
+      requiredFishingRole.equals("") ||
+      requiredFishingRole.equals("0") ||
+      requestDto.getUserRoles().contains(requiredFishingRole)
+    ) {
+      return null;
+    }
+
+    List<String> requiredFishingBypassRoles = transferResponseDto
+      .getGuildConfigurations()
+      .getFishingBypassRoles();
+
+    if (
+      requiredFishingBypassRoles != null &&
+      requestDto
+        .getUserRoles()
+        .stream()
+        .anyMatch(requiredFishingBypassRoles::contains)
+    ) {
+      return null;
+    }
+
+    String errorMessage =
+      "<@" +
+      requestDto.getUserId() +
+      "> does not currently hold the required role (<@&" +
+      requiredFishingRole +
+      ">) for fishing.";
+
+    String requiredFishingRoleMessage = transferResponseDto
+      .getGuildConfigurations()
+      .getFishingError();
+
+    if (
+      requiredFishingRoleMessage != null &&
+      !requiredFishingRoleMessage.isEmpty()
+    ) {
+      errorMessage += "\n\n**Server Message:** " + requiredFishingRoleMessage;
+    }
+
+    return errorMessage;
+  }
+
+  /** Creatures the bot can hand out at all, i.e. whose currency is enabled. */
+  private List<CreatureDto> findStockedCreatures(
+    List<CreatureEntity> creatureEntities,
+    List<CurrencyDto> currencies
+  ) {
+    Map<String, Boolean> currencyEnabledMap = currencies
+      .stream()
+      .collect(
+        Collectors.toMap(CurrencyDto::getTicker, CurrencyDto::getEnabled)
+      );
+
+    return creatureEntities
+      .stream()
+      .filter(creature ->
+        Boolean.TRUE.equals(currencyEnabledMap.get(creature.getTicker()))
+      )
+      .map(CreatureDto::new)
+      .toList();
+  }
+
+  private Map<String, BigInteger> findMaxCreatureValuesByTicker(
+    List<CreatureDto> creatures
+  ) {
+    Map<String, BigInteger> maxCreatureValuesByTicker = new HashMap<>();
+    for (CreatureDto creature : creatures) {
+      maxCreatureValuesByTicker.merge(
+        creature.getTicker(),
+        new BigInteger(creature.getValue()),
+        BigInteger::max
+      );
+    }
+    return maxCreatureValuesByTicker;
+  }
+
+  /**
+   * Tickers whose guild reserve covers the priciest creature on that ticker.
+   * The reserve must cover twice the value, matching what the catch debits.
+   */
+  private Set<String> findAffordableTickers(
+    List<WalletDto> guildWallet,
+    Map<String, BigInteger> maxCreatureValuesByTicker
+  ) {
+    Set<String> affordableTickers = new HashSet<>();
+
+    for (WalletDto wallet : guildWallet) {
+      BigInteger maxCreatureValue = maxCreatureValuesByTicker.get(
+        wallet.getTicker()
+      );
+
+      if (maxCreatureValue == null) {
+        continue;
+      }
+
+      BigInteger walletBalance = new BigInteger(wallet.getRaw());
+      if (
+        walletBalance.compareTo(maxCreatureValue.multiply(RESERVE_MULTIPLIER)) >=
+        0
+      ) {
+        affordableTickers.add(wallet.getTicker());
+      }
+    }
+
+    return affordableTickers;
+  }
+
+  private String normalizeTicker(String ticker) {
+    if (ticker == null || ticker.isBlank()) {
+      return null;
+    }
+    return ticker.trim().toUpperCase();
+  }
+
+  /**
+   * Error when the user asked for a currency this server cannot fish right now,
+   * either because nothing has been stocked for it or because the reserve is
+   * too low, otherwise null.
+   */
+  private String findRequestedTickerError(
+    String requestedTicker,
+    Set<String> stockedTickers,
+    Set<String> affordableTickers,
+    String userId,
+    String botUserId,
+    Map<String, String> commandMap,
+    List<CurrencyDto> currencies
+  ) {
+    if (affordableTickers.contains(requestedTicker)) {
+      return null;
+    }
+
+    String requested = formatCurrencyLabel(requestedTicker, currencies);
+    String available = formatCurrencyLabels(affordableTickers, currencies);
+    String fishAgain =
+      "Run </" +
+      Constants.COMMAND_NAME_FISH +
+      ":" +
+      commandMap.get(Constants.COMMAND_NAME_FISH) +
+      "> without a currency to fish for anything!";
+
+    if (!stockedTickers.contains(requestedTicker)) {
+      return (
+        "<@" +
+        userId +
+        "> cannot fish for " +
+        requested +
+        " creatures because none have been added for that currency yet.\n" +
+        "Available currencies for fishing in this server: " +
+        available +
+        "\n" +
+        fishAgain
+      );
+    }
+
+    return (
+      "<@" +
+      userId +
+      "> cannot fish for " +
+      requested +
+      " creatures because this server's </" +
+      Constants.COMMAND_NAME_RESERVES +
+      ":" +
+      commandMap.get(Constants.COMMAND_NAME_RESERVES) +
+      "> for that currency does not meet the minimum requirement.\n" +
+      "Available currencies for fishing in this server: " +
+      available +
+      "\n" +
+      "Any user can </" +
+      Constants.COMMAND_NAME_GIFT +
+      ":" +
+      commandMap.get(Constants.COMMAND_NAME_GIFT) +
+      "> <@" +
+      botUserId +
+      "> from within a server to contribute to that server's </" +
+      Constants.COMMAND_NAME_RESERVES +
+      ":" +
+      commandMap.get(Constants.COMMAND_NAME_RESERVES) +
+      ">!\n" +
+      fishAgain
+    );
+  }
+
+  /** A currency rendered as "emoji Name [TICKER]", falling back to the ticker. */
+  private String formatCurrencyLabel(
+    String ticker,
+    List<CurrencyDto> currencies
+  ) {
+    return currencies
+      .stream()
+      .filter(currency -> ticker.equals(currency.getTicker()))
+      .findFirst()
+      .map(currency -> {
+        String label = currency.getName() + " [" + currency.getTicker() + "]";
+        return currency.getEmoji() == null || currency.getEmoji().isBlank()
+          ? label
+          : currency.getEmoji() + " " + label;
+      })
+      .orElse(ticker);
+  }
+
+  private String formatCurrencyLabels(
+    Collection<String> tickers,
+    List<CurrencyDto> currencies
+  ) {
+    return tickers
+      .stream()
+      .sorted(Comparator.naturalOrder())
+      .map(ticker -> formatCurrencyLabel(ticker, currencies))
+      .collect(Collectors.joining(", "));
+  }
+
+  private String formatEmptyReservesError(
+    String userId,
+    String botUserId,
+    Map<String, String> commandMap
+  ) {
+    return (
+      "<@" +
+      userId +
+      "> cannot fish because the server balance does not meet the minimum requirement.\n" +
+      "Any user can </" +
+      Constants.COMMAND_NAME_GIFT +
+      ":" +
+      commandMap.get(Constants.COMMAND_NAME_GIFT) +
+      "> <@" +
+      botUserId +
+      "> from within a server to contribute to that server's fishing </" +
+      Constants.COMMAND_NAME_RESERVES +
+      ":" +
+      commandMap.get(Constants.COMMAND_NAME_RESERVES) +
+      ">!\n" +
+      "See </" +
+      Constants.COMMAND_NAME_HELP +
+      ":" +
+      commandMap.get(Constants.COMMAND_NAME_HELP) +
+      "> for more information!"
+    );
+  }
+
+  /**
+   * Error when the user already holds a full stack of something they could
+   * catch, otherwise null. Only the creatures still in the pool are checked, so
+   * a full stack of one currency's creature does not block another currency.
+   */
+  private String findCapacityError(
+    UserItemsEntity senderItems,
+    List<CreatureDto> catchPool,
+    String userId,
+    Map<String, String> commandMap
+  ) {
+    if (senderItems.getItems() == null) {
+      return null;
+    }
+
+    for (ItemDto userItem : senderItems.getItems()) {
+      for (CreatureDto creature : catchPool) {
+        if (
+          userItem.getName().equalsIgnoreCase(creature.getName()) &&
+          userItem.getQuantity() >= creature.getCapacity()
+        ) {
+          return (
+            "<@" +
+            userId +
+            "> has one or more </" +
+            Constants.COMMAND_NAME_INVENTORY +
+            ":" +
+            commandMap.get(Constants.COMMAND_NAME_INVENTORY) +
+            "> items at or above maximum capacity!" +
+            "\n" +
+            "Convert inventory items into currencies with </" +
+            Constants.COMMAND_NAME_SELL +
+            ":" +
+            commandMap.get(Constants.COMMAND_NAME_SELL) +
+            ">!"
+          );
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Error when the user is still resting from their last catch, otherwise null. */
+  private String findCooldownError(
+    RequestDto requestDto,
+    TransferResponseDto transferResponseDto,
+    Map<String, String> commandMap
+  ) {
+    Optional<AnglerEntity> anglerTimestamp =
+      anglersService.getAnglerByGuildIdAndUserId(
+        requestDto.getGuildId(),
+        requestDto.getUserId()
+      );
+
+    if (anglerTimestamp.isEmpty()) {
+      return null;
+    }
+
+    Integer fishingFrequency = transferResponseDto
+      .getGuildConfigurations()
+      .getFishingFrequency();
+    Integer guildTime = (fishingFrequency != null && fishingFrequency != 0)
+      ? fishingFrequency
+      : DEFAULT_FISHING_FREQUENCY_MINUTES;
+
+    Date timestamp = anglerTimestamp.get().getTimestamp();
+    long remaining =
+      timestamp.getTime() +
+      (guildTime * 60 * 1000L) -
+      System.currentTimeMillis();
+
+    if (remaining <= 0) {
+      return null;
+    }
+
+    return (
+      "<@" +
+      requestDto.getUserId() +
+      "> must wait " +
+      TimeUtil.formatTimeRemaining(remaining) +
+      " to </" +
+      Constants.COMMAND_NAME_FISH +
+      ":" +
+      commandMap.get(Constants.COMMAND_NAME_FISH) +
+      "> again."
+    );
+  }
+
+  /** Weighted lottery over the pool, where a creature's odds are its weight. */
+  private CreatureDto selectWeightedCreature(List<CreatureDto> catchPool) {
+    int totalOdds = 0;
+    for (CreatureDto creature : catchPool) {
+      totalOdds += creature.getOdds();
+    }
+
+    if (totalOdds <= 0) {
+      return null;
+    }
+
+    int rand = new SecureRandom().nextInt(totalOdds);
+
+    int cumulative = 0;
+    for (CreatureDto creature : catchPool) {
+      cumulative += creature.getOdds();
+      if (rand < cumulative) {
+        return creature;
+      }
+    }
+
+    return null;
   }
 }

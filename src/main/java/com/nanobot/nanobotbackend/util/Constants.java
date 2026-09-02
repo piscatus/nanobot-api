@@ -42,4 +42,12 @@ public class Constants {
   public static final int maximumDropUsers = 10000;
   /** Scale for converting USD amounts into crypto units (matches max fractional digits on $ input). */
   public static final int dollarToCryptoDecimalPlaces = 8;
+  //
+  /**
+   * Chain protocol identifiers selecting a ChainAdapter. Currency documents
+   * created before this field existed resolve to NANO.
+   */
+  public static final String PROTOCOL_NANO = "NANO";
+  public static final String PROTOCOL_MONERO = "MONERO";
+  public static final String PROTOCOL_BITCOIN = "BITCOIN";
 }

@@ -26,6 +26,8 @@ class QueueEntityTest {
     LevelDto level = LevelDto.RECEIVE;
     QueueDto dto = new QueueDto("u1", "src", "tgt", level, "hash", "raw", "NANO", true, "seed", ts, "tx-1");
     dto.setId("q-1");
+    dto.setIndex(6L);
+    dto.setPrivateKey("queue-pk");
 
     QueueEntity entity = new QueueEntity(dto);
 
@@ -39,6 +41,8 @@ class QueueEntityTest {
     assertEquals("NANO", entity.getTicker());
     assertEquals(true, entity.getProcessed());
     assertEquals("seed", entity.getSeed());
+    assertEquals(6L, entity.getIndex());
+    assertEquals("queue-pk", entity.getPrivateKey());
     assertEquals(ts, entity.getTimestamp());
     assertEquals("tx-1", entity.getTransactionId());
   }
@@ -51,11 +55,15 @@ class QueueEntityTest {
     entity.setTargetAddress("tgt2");
     entity.setProcessed(true);
     entity.setTransactionId("tx-2");
+    entity.setIndex(2L);
+    entity.setPrivateKey("pk-2");
 
     assertEquals("u2", entity.getUserId());
     assertEquals("src2", entity.getSourceAddress());
     assertEquals("tgt2", entity.getTargetAddress());
     assertEquals(true, entity.getProcessed());
     assertEquals("tx-2", entity.getTransactionId());
+    assertEquals(2L, entity.getIndex());
+    assertEquals("pk-2", entity.getPrivateKey());
   }
 }

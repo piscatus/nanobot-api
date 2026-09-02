@@ -1,5 +1,6 @@
 package com.nanobot.nanobotbackend.service;
 
+import com.nanobot.nanobotbackend.dto.LevelDto;
 import com.nanobot.nanobotbackend.dto.QueueDto;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
 import com.nanobot.nanobotbackend.repository.QueuesRepository;
@@ -7,6 +8,10 @@ import com.nanobot.nanobotbackend.task.FileLogger;
 import java.util.List;
 import java.util.Optional;
 import org.bson.types.ObjectId;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -14,11 +19,17 @@ public class QueuesServiceImpl implements QueuesService {
 
   private QueuesRepository queuesRepository;
 
+  private final MongoTemplate mongoTemplate;
+
   private final FileLogger fileLogger;
 
-  public QueuesServiceImpl(QueuesRepository queuesRepository) {
+  public QueuesServiceImpl(
+    QueuesRepository queuesRepository,
+    MongoTemplate mongoTemplate
+  ) {
     this.fileLogger = new FileLogger("QueuesService");
     this.queuesRepository = queuesRepository;
+    this.mongoTemplate = mongoTemplate;
   }
 
   @Override
@@ -45,6 +56,104 @@ public class QueuesServiceImpl implements QueuesService {
     } catch (Exception e) {
       fileLogger.error("Error fetching queues: " + e.getMessage());
       throw e;
+    }
+  }
+
+  @Override
+  public List<QueueEntity> getQueuesByTicker(String ticker) {
+    if (ticker == null) {
+      return List.of();
+    }
+    try {
+      return queuesRepository.findByTickerOrderByTimestampAsc(ticker);
+    } catch (Exception e) {
+      fileLogger.error(
+        "Error fetching queues for " + ticker + ": " + e.getMessage()
+      );
+      throw e;
+    }
+  }
+
+  @Override
+  public boolean isDepositQueued(String ticker, String sourceHash) {
+    if (ticker == null || sourceHash == null) {
+      return false;
+    }
+    try {
+      // Scoped to RECEIVE because a SEND entry stores the hash of the block it
+      // published, and the bot sending to an address it custodies - a
+      // withdrawal to a user's own deposit address, or a consolidation sweep
+      // into the hot wallet - produces a SEND entry holding the very hash the
+      // resulting deposit is identified by. Matching it would discard the
+      // deposit.
+      //
+      // blockHash is checked as well because it held the send hash before
+      // sourceHash existed, so an entry queued by an older build is still
+      // recognised rather than being pocketed a second time.
+      return (
+        queuesRepository.existsByTickerAndSourceHashAndLevel(
+          ticker,
+          sourceHash,
+          LevelDto.RECEIVE
+        ) ||
+        queuesRepository.existsByTickerAndBlockHashAndLevel(
+          ticker,
+          sourceHash,
+          LevelDto.RECEIVE
+        )
+      );
+    } catch (Exception e) {
+      fileLogger.error(
+        "Error checking queued deposit " + sourceHash + ": " + e.getMessage()
+      );
+      // Reporting "already queued" on failure is the safe direction: a missed
+      // deposit is picked up by the next reconciliation sweep, a double pocket
+      // is not recoverable.
+      return true;
+    }
+  }
+
+  @Override
+  public boolean isSweepQueued(String ticker, String sourceAddress) {
+    if (ticker == null || sourceAddress == null) {
+      return false;
+    }
+    try {
+      return queuesRepository.existsByTickerAndSourceAddressAndLevel(
+        ticker,
+        sourceAddress,
+        LevelDto.SEND
+      );
+    } catch (Exception e) {
+      fileLogger.error(
+        "Error checking queued sweep for " +
+        sourceAddress +
+        ": " +
+        e.getMessage()
+      );
+      return true;
+    }
+  }
+
+  @Override
+  public Optional<QueueEntity> getProcessedQueueByBlockHash(
+    String ticker,
+    String blockHash
+  ) {
+    if (ticker == null || blockHash == null) {
+      return Optional.empty();
+    }
+    try {
+      return queuesRepository.findByTickerAndBlockHashAndProcessed(
+        ticker,
+        blockHash,
+        true
+      );
+    } catch (Exception e) {
+      fileLogger.error(
+        "Error fetching queue for block " + blockHash + ": " + e.getMessage()
+      );
+      return Optional.empty();
     }
   }
 
@@ -77,6 +186,8 @@ public class QueuesServiceImpl implements QueuesService {
           queues.setTicker(queueDto.getTicker());
           queues.setProcessed(queueDto.getProcessed());
           queues.setTimestamp(queueDto.getTimestamp());
+          queues.setAttempts(queueDto.getAttempts());
+          queues.setIndex(queueDto.getIndex());
 
           QueueEntity updatedQueue = queuesRepository.save(queues);
           fileLogger.info("Queue updated with ID: " + id);
@@ -91,6 +202,46 @@ public class QueuesServiceImpl implements QueuesService {
       }
     }
     return Optional.empty();
+  }
+
+  @Override
+  public boolean updateQueueProgress(
+    String id,
+    Integer attempts,
+    Long index,
+    String blockHash,
+    Boolean processed
+  ) {
+    if (id == null) {
+      return false;
+    }
+    Update update = new Update();
+    if (attempts != null) {
+      update.set("attempts", attempts);
+    }
+    if (index != null) {
+      update.set("index", index);
+    }
+    if (blockHash != null) {
+      update.set("blockHash", blockHash);
+    }
+    if (processed != null) {
+      update.set("processed", processed);
+    }
+    if (!update.getUpdateObject().containsKey("$set")) {
+      return false;
+    }
+    try {
+      mongoTemplate.updateFirst(
+        Query.query(Criteria.where("_id").is(id)),
+        update,
+        QueueEntity.class
+      );
+      return true;
+    } catch (Exception e) {
+      fileLogger.error("Error updating queue progress: " + e.getMessage());
+      return false;
+    }
   }
 
   @Override

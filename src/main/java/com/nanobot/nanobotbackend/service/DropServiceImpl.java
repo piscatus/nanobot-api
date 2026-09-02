@@ -2,14 +2,19 @@ package com.nanobot.nanobotbackend.service;
 
 import com.nanobot.nanobotbackend.dto.BaseResponseDto;
 import com.nanobot.nanobotbackend.dto.CommandDto;
+import com.nanobot.nanobotbackend.dto.ItemDto;
 import com.nanobot.nanobotbackend.dto.MessageDto;
 import com.nanobot.nanobotbackend.dto.PickupDto;
 import com.nanobot.nanobotbackend.dto.RequestDto;
+import com.nanobot.nanobotbackend.dto.TransferDto;
 import com.nanobot.nanobotbackend.dto.TransferResponseDto;
+import com.nanobot.nanobotbackend.dto.WalletDto;
+import com.nanobot.nanobotbackend.entity.CurrencyEntity;
 import com.nanobot.nanobotbackend.entity.DropEntity;
 import com.nanobot.nanobotbackend.entity.PickupEntity;
 import com.nanobot.nanobotbackend.task.FileLogger;
 import com.nanobot.nanobotbackend.util.Constants;
+import com.nanobot.nanobotbackend.util.StringUtil;
 import com.nanobot.nanobotbackend.util.TimeUtil;
 import java.math.BigInteger;
 import java.security.SecureRandom;
@@ -31,6 +36,8 @@ public class DropServiceImpl implements DropService {
 
   private final CoreServices coreServices;
 
+  private final CurrenciesService currenciesService;
+
   private final DropsService dropsService;
 
   private final MessagesService messagesService;
@@ -42,12 +49,14 @@ public class DropServiceImpl implements DropService {
 
   public DropServiceImpl(
     CoreServices coreServices,
+    CurrenciesService currenciesService,
     DropsService dropsService,
     MessagesService messagesService,
     PickupsService pickupsService
   ) {
     this.fileLogger = new FileLogger("DropService");
     this.coreServices = coreServices;
+    this.currenciesService = currenciesService;
     this.dropsService = dropsService;
     this.messagesService = messagesService;
     this.pickupsService = pickupsService;
@@ -58,11 +67,34 @@ public class DropServiceImpl implements DropService {
     DropEntity drop,
     List<PickupDto> pickeruppers
   ) {
+    return formatPickeruppers(dropCommandId, drop, pickeruppers, null);
+  }
+
+  /**
+   * @param eachSummary per-recipient amount, appended so winners can see what
+   *   they individually received rather than only the pooled total. Null when
+   *   the split is not known, such as a drop that ended with no winners.
+   */
+  public String formatPickeruppers(
+    String dropCommandId,
+    DropEntity drop,
+    List<PickupDto> pickeruppers,
+    String eachSummary
+  ) {
     int size = pickeruppers.size();
-    String response =
+    // Mention plus plain username: an uncached member renders as a raw id, so
+    // the mention alone leaves other readers unable to tell who dropped.
+    String creator =
       "<@" +
       drop.getUserId() +
-      "> used </drop:" +
+      ">" +
+      (StringUtil.isValidString(drop.getUsername())
+          ? " (" + drop.getUsername() + ")"
+          : "");
+
+    String response =
+      creator +
+      " used </drop:" +
       dropCommandId +
       "> to transfer **" +
       drop.getInput() +
@@ -71,11 +103,21 @@ public class DropServiceImpl implements DropService {
       " to ";
 
     if (size == 0) {
-      response += "**no one**!";
-      return response;
+      return response + "**no one**!";
     }
 
-    // Map all to formatted mentions
+    response += formatRecipientMentions(pickeruppers);
+
+    // Appended after the recipient list so every winner count gets it.
+    if (StringUtil.isValidString(eachSummary)) {
+      response += "\n" + eachSummary;
+    }
+    return response;
+  }
+
+  private static String formatRecipientMentions(List<PickupDto> pickeruppers) {
+    int size = pickeruppers.size();
+
     List<String> mentions = pickeruppers
       .stream()
       .map(p -> "<@" + p.getUserId() + ">")
@@ -85,32 +127,84 @@ public class DropServiceImpl implements DropService {
 
     // If more than 40, show first 40 and say "and X others!"
     if (size > displayLimit) {
-      List<String> firstMentions = mentions.subList(0, displayLimit);
-      String formatted = String.join(", ", firstMentions);
+      String formatted = String.join(
+        ", ",
+        mentions.subList(0, displayLimit)
+      );
       int remaining = size - displayLimit;
-      String othersText =
-        " and " + remaining + (remaining == 1 ? " other!" : " others!");
-      response += formatted + othersText;
-      return response;
+      return (
+        formatted +
+        " and " +
+        remaining +
+        (remaining == 1 ? " other!" : " others!")
+      );
     }
 
-    // 1 person
     if (size == 1) {
-      response += mentions.get(0) + "!";
-      return response;
+      return mentions.get(0) + "!";
     }
 
-    // 2 people
     if (size == 2) {
-      response += mentions.get(0) + " and " + mentions.get(1) + "!";
-      return response;
+      return mentions.get(0) + " and " + mentions.get(1) + "!";
     }
 
     // 3 to 40 people
     String allButLast = String.join(", ", mentions.subList(0, size - 1));
-    String last = mentions.get(size - 1);
-    response += allButLast + ", and " + last + "!";
-    return response;
+    return allButLast + ", and " + mentions.get(size - 1) + "!";
+  }
+
+  /**
+   * Compact per-recipient summary built from what was actually transferred,
+   * rather than dividing the pooled input, so integer-division remainders are
+   * reflected accurately.
+   */
+  private String formatEachSummary(TransferResponseDto transfer) {
+    if (transfer == null || transfer.getCompletedSecondaryTransfers() == null) {
+      return null;
+    }
+    Optional<TransferDto> perRecipient = transfer
+      .getCompletedSecondaryTransfers()
+      .flatMap(map -> map.values().stream().findFirst());
+    if (perRecipient.isEmpty()) {
+      return null;
+    }
+
+    List<String> parts = new ArrayList<>();
+
+    for (WalletDto wallet : perRecipient.get().getWallets()) {
+      if (wallet.getRaw() == null || "0".equals(wallet.getRaw())) {
+        continue;
+      }
+      Optional<CurrencyEntity> currency = currenciesService.getCurrencyByTicker(
+        wallet.getTicker()
+      );
+      if (currency.isEmpty()) {
+        continue;
+      }
+      parts.add(
+        "**" +
+        currenciesService.getCurrencyDecimalValue(
+          wallet.getRaw(),
+          Integer.parseInt(currency.get().getPrecision())
+        ) +
+        " " +
+        wallet.getTicker() +
+        "** " +
+        currency.get().getEmoji()
+      );
+    }
+
+    for (ItemDto item : perRecipient.get().getItems()) {
+      if (item.getQuantity() <= 0) {
+        continue;
+      }
+      parts.add("**" + item.getQuantity() + " " + item.getName() + "**");
+    }
+
+    if (parts.isEmpty()) {
+      return null;
+    }
+    return "-# Each winner received " + String.join(", ", parts) + ".";
   }
 
   /**
@@ -331,7 +425,7 @@ public class DropServiceImpl implements DropService {
 
         transferResponseDto.setSecondaryTransfer(drop.getTransfer());
 
-        transferExecutorService.executeTransfer(
+        TransferResponseDto completed = transferExecutorService.executeTransfer(
           Constants.COMMAND_NAME_DROP,
           drop.getGuildId(),
           drop.getChannelId(),
@@ -355,7 +449,8 @@ public class DropServiceImpl implements DropService {
           formatPickeruppers(
             commandMap.get("drop"),
             drop,
-            sortPickupsByJoinTimeForDisplay(pickeruppers)
+            sortPickupsByJoinTimeForDisplay(pickeruppers),
+            formatEachSummary(completed)
           ),
           new Date(),
           null,

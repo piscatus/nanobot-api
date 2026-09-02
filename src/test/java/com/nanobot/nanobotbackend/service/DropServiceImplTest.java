@@ -36,6 +36,9 @@ class DropServiceImplTest {
   private CoreServices coreServices;
 
   @Mock
+  private CurrenciesService currenciesService;
+
+  @Mock
   private DropsService dropsService;
 
   @Mock
@@ -51,7 +54,7 @@ class DropServiceImplTest {
 
   @BeforeEach
   void setUp() {
-    dropService = new DropServiceImpl(coreServices, dropsService, messagesService, pickupsService);
+    dropService = new DropServiceImpl(coreServices, currenciesService, dropsService, messagesService, pickupsService);
     // Inject TransferExecutorService via reflection since it's @Autowired
     try {
       var field = DropServiceImpl.class.getDeclaredField("transferExecutorService");
@@ -73,7 +76,7 @@ class DropServiceImplTest {
     String result = dropService.formatPickeruppers("drop-cmd-id", drop, pickeruppers);
 
     assertEquals(
-      "<@u1> used </drop:drop-cmd-id> to transfer `100`\nNANO to **no one**!",
+      "<@u1> used </drop:drop-cmd-id> to transfer **100**\nNANO to **no one**!",
       result
     );
   }
@@ -91,7 +94,7 @@ class DropServiceImplTest {
     String result = dropService.formatPickeruppers("drop-cmd-id", drop, pickeruppers);
 
     assertEquals(
-      "<@u1> used </drop:drop-cmd-id> to transfer `100`\nNANO to <@u2>!",
+      "<@u1> used </drop:drop-cmd-id> to transfer **100**\nNANO to <@u2>!",
       result
     );
   }
@@ -111,7 +114,7 @@ class DropServiceImplTest {
     String result = dropService.formatPickeruppers("drop-cmd-id", drop, pickeruppers);
 
     assertEquals(
-      "<@u1> used </drop:drop-cmd-id> to transfer `100`\nNANO to <@u2> and <@u3>!",
+      "<@u1> used </drop:drop-cmd-id> to transfer **100**\nNANO to <@u2> and <@u3>!",
       result
     );
   }
@@ -133,7 +136,7 @@ class DropServiceImplTest {
     String result = dropService.formatPickeruppers("drop-cmd-id", drop, pickeruppers);
 
     assertEquals(
-      "<@u1> used </drop:drop-cmd-id> to transfer `100`\nNANO to <@u2>, <@u3>, and <@u4>!",
+      "<@u1> used </drop:drop-cmd-id> to transfer **100**\nNANO to <@u2>, <@u3>, and <@u4>!",
       result
     );
   }
@@ -287,6 +290,7 @@ class DropServiceImplTest {
         org.mockito.Mockito.mock(com.nanobot.nanobotbackend.service.GuildConfigurationsService.class),
         org.mockito.Mockito.mock(com.nanobot.nanobotbackend.service.UserDetailsService.class)
       ),
+      currenciesService,
       dropsService,
       messagesService,
       pickupsService
@@ -336,6 +340,7 @@ class DropServiceImplTest {
         org.mockito.Mockito.mock(com.nanobot.nanobotbackend.service.GuildConfigurationsService.class),
         org.mockito.Mockito.mock(com.nanobot.nanobotbackend.service.UserDetailsService.class)
       ),
+      currenciesService,
       dropsService,
       messagesService,
       pickupsService

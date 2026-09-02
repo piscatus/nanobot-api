@@ -8,8 +8,12 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -32,9 +36,35 @@ public class PriceServiceImpl implements PriceService {
     this.fileLogger = new FileLogger("PriceService");
   }
 
+  /**
+   * CoinGecko ids of the currencies to price, read from the database so adding a
+   * currency needs no code change. Falls back to the tickered name when a
+   * document has no priceId, which keeps pre-existing Nano and Banano documents
+   * working before they are backfilled.
+   */
+  String buildCoinIds() {
+    List<CurrencyEntity> currencies = currenciesRepository.findAll();
+    Set<String> ids = new LinkedHashSet<>();
+    for (CurrencyEntity currency : currencies) {
+      String priceId = currency.getPriceId();
+      if (priceId != null && !priceId.isBlank()) {
+        ids.add(priceId.trim().toLowerCase());
+      } else if (currency.getName() != null && !currency.getName().isBlank()) {
+        ids.add(currency.getName().trim().toLowerCase());
+      }
+    }
+    return String.join(",", ids);
+  }
+
   @Override
   public void checkPrices() {
     final int MAX_RETRIES = 3;
+
+    String coinIds = buildCoinIds();
+    if (coinIds.isEmpty()) {
+      fileLogger.warn("No currencies to price.");
+      return;
+    }
 
     for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
@@ -42,7 +72,8 @@ public class PriceServiceImpl implements PriceService {
           .uri(
             URI.create(
               "https://api.coingecko.com/api/v3/coins/markets" +
-              "?vs_currency=usd&ids=nano%2Cbanano" +
+              "?vs_currency=usd&ids=" +
+              URLEncoder.encode(coinIds, StandardCharsets.UTF_8) +
               "&order=market_cap_desc&per_page=100&page=1" +
               "&sparkline=false&locale=en"
             )

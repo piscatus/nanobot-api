@@ -18,6 +18,18 @@ public class QueueEntity extends BaseEntity {
 
   private String blockHash;
 
+  /**
+   * For a RECEIVE, the hash of the incoming send being pocketed.
+   *
+   * <p>Held separately because {@code blockHash} starts out as that same send
+   * hash but is overwritten with the published receive block once the entry is
+   * processed. Losing the send hash would leave nothing stable to identify the
+   * deposit by, which is what both the queue de-duplication and the
+   * depositRecords double-credit guard key on. Null on entries created before
+   * this field existed, and on SEND and UPDATE entries.
+   */
+  private String sourceHash;
+
   private String raw;
 
   private String ticker;
@@ -26,9 +38,16 @@ public class QueueEntity extends BaseEntity {
 
   private String seed;
 
+  private Long index;
+
+  private String privateKey;
+
   private Date timestamp;
 
   private String transactionId;
+
+  /** Failed on-chain submissions for this entry. */
+  private Integer attempts;
 
   public QueueEntity() {
     super();
@@ -41,12 +60,24 @@ public class QueueEntity extends BaseEntity {
     this.targetAddress = queue.getTargetAddress();
     this.level = queue.getLevel();
     this.blockHash = queue.getBlockHash();
+    this.sourceHash = queue.getSourceHash();
     this.raw = queue.getRaw();
     this.ticker = queue.getTicker();
     this.processed = queue.getProcessed();
     this.seed = queue.getSeed();
+    this.index = queue.getIndex();
+    this.privateKey = queue.getPrivateKey();
     this.timestamp = queue.getTimestamp();
     this.transactionId = queue.getTransactionId();
+    this.attempts = queue.getAttempts();
+  }
+
+  public Integer getAttempts() {
+    return attempts;
+  }
+
+  public void setAttempts(Integer attempts) {
+    this.attempts = attempts;
   }
 
   public String getTransactionId() {
@@ -97,6 +128,19 @@ public class QueueEntity extends BaseEntity {
     this.blockHash = blockHash;
   }
 
+  public String getSourceHash() {
+    return sourceHash;
+  }
+
+  public void setSourceHash(String sourceHash) {
+    this.sourceHash = sourceHash;
+  }
+
+  /** The send hash for a RECEIVE, falling back to entries that predate it. */
+  public String resolveDepositHash() {
+    return sourceHash == null ? blockHash : sourceHash;
+  }
+
   public String getRaw() {
     return raw;
   }
@@ -127,6 +171,22 @@ public class QueueEntity extends BaseEntity {
 
   public void setSeed(String seed) {
     this.seed = seed;
+  }
+
+  public Long getIndex() {
+    return index;
+  }
+
+  public void setIndex(Long index) {
+    this.index = index;
+  }
+
+  public String getPrivateKey() {
+    return privateKey;
+  }
+
+  public void setPrivateKey(String privateKey) {
+    this.privateKey = privateKey;
   }
 
   public Date getTimestamp() {

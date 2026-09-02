@@ -31,6 +31,8 @@ public class DropDto extends BaseDto {
 
   private String userId;
 
+  private String username;
+
   public DropDto() {
     super();
   }
@@ -50,6 +52,7 @@ public class DropDto extends BaseDto {
     this.startTime = entity.getStartTime();
     this.transfer = entity.getTransfer();
     this.userId = entity.getUserId();
+    this.username = entity.getUsername();
   }
 
   public DropDto(
@@ -183,5 +186,13 @@ public class DropDto extends BaseDto {
 
   public void setUserId(String userId) {
     this.userId = userId;
+  }
+
+  public String getUsername() {
+    return username;
+  }
+
+  public void setUsername(String username) {
+    this.username = username;
   }
 }

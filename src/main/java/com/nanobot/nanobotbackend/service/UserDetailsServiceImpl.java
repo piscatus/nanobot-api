@@ -6,6 +6,7 @@ import com.nanobot.nanobotbackend.dto.UserDetailsDto;
 import com.nanobot.nanobotbackend.dto.WalletDto;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;
 import com.nanobot.nanobotbackend.repository.UserDetailsRepository;
+import com.nanobot.nanobotbackend.service.chain.DepositAddressResolver;
 import com.nanobot.nanobotbackend.task.FileLogger;
 import com.nanobot.nanobotbackend.util.CryptoUtil;
 import com.nanobot.nanobotbackend.util.StringUtil;
@@ -22,11 +23,17 @@ public class UserDetailsServiceImpl implements UserDetailsService {
 
   private UserDetailsRepository userDetailsRepository;
 
+  private final DepositAddressResolver depositAddressResolver;
+
   private final FileLogger fileLogger;
 
-  public UserDetailsServiceImpl(UserDetailsRepository userDetailsRepository) {
+  public UserDetailsServiceImpl(
+    UserDetailsRepository userDetailsRepository,
+    DepositAddressResolver depositAddressResolver
+  ) {
     this.fileLogger = new FileLogger("UserDetailsService");
     this.userDetailsRepository = userDetailsRepository;
+    this.depositAddressResolver = depositAddressResolver;
   }
 
   @Override
@@ -62,13 +69,21 @@ public class UserDetailsServiceImpl implements UserDetailsService {
     for (CurrencyDto currencyDto : currencies) {
       if (currencyDto.getEnabled()) {
         String ticker = currencyDto.getTicker();
-        addresses.add(
-          new WalletDto(
-            ticker,
-            CryptoUtil.deriveAddressFromSeed(userDetails.getSeed(), ticker),
-            currencyDto.getName()
-          )
-        );
+        // Routed through the adapter rather than derived directly: Nano forks
+        // derive from the user's seed, while Monero has to issue a subaddress
+        // from the hot wallet.
+        String address = depositAddressResolver.resolve(userDetails, ticker);
+        if (address == null) {
+          fileLogger.warn(
+            "Skipping " +
+            ticker +
+            " deposit address for user " +
+            userDetails.getUserId() +
+            "; none could be resolved."
+          );
+          continue;
+        }
+        addresses.add(new WalletDto(ticker, address, currencyDto.getName()));
       }
     }
     return addresses;
@@ -201,6 +216,8 @@ public class UserDetailsServiceImpl implements UserDetailsService {
           UserDetailsEntity user = userOptional.get();
           user.setStatus(userDetailsDto.getStatus());
           user.setSeed(userDetailsDto.getSeed());
+          user.setIndex(userDetailsDto.getIndex());
+          user.setPrivateKey(userDetailsDto.getPrivateKey());
           user.setUserId(userDetailsDto.getUserId());
           user.setSubordinateUserId(userDetailsDto.getSubordinateUserId());
 

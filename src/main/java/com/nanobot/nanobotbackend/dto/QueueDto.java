@@ -15,6 +15,9 @@ public class QueueDto extends BaseDto {
 
   private String blockHash;
 
+  /** For a RECEIVE, the hash of the incoming send being pocketed. */
+  private String sourceHash;
+
   private String raw;
 
   private String ticker;
@@ -23,9 +26,15 @@ public class QueueDto extends BaseDto {
 
   private String seed;
 
+  private Long index;
+
+  private String privateKey;
+
   private Date timestamp;
 
   private String transactionId;
+
+  private Integer attempts;
 
   public QueueDto(QueueEntity entity) {
     super(entity.getId());
@@ -34,12 +43,24 @@ public class QueueDto extends BaseDto {
     this.targetAddress = entity.getTargetAddress();
     this.level = entity.getLevel();
     this.blockHash = entity.getBlockHash();
+    this.sourceHash = entity.getSourceHash();
     this.raw = entity.getRaw();
     this.ticker = entity.getTicker();
     this.processed = entity.getProcessed();
     this.seed = entity.getSeed();
+    this.index = entity.getIndex();
+    this.privateKey = entity.getPrivateKey();
     this.timestamp = entity.getTimestamp();
     this.transactionId = entity.getTransactionId();
+    this.attempts = entity.getAttempts();
+  }
+
+  public Integer getAttempts() {
+    return attempts;
+  }
+
+  public void setAttempts(Integer attempts) {
+    this.attempts = attempts;
   }
 
   public QueueDto(
@@ -61,6 +82,7 @@ public class QueueDto extends BaseDto {
     this.targetAddress = targetAddress;
     this.level = level;
     this.blockHash = blockHash;
+    this.sourceHash = level == LevelDto.RECEIVE ? blockHash : null;
     this.raw = raw;
     this.ticker = ticker;
     this.processed = processed;
@@ -117,6 +139,14 @@ public class QueueDto extends BaseDto {
     this.blockHash = blockHash;
   }
 
+  public String getSourceHash() {
+    return sourceHash;
+  }
+
+  public void setSourceHash(String sourceHash) {
+    this.sourceHash = sourceHash;
+  }
+
   public String getRaw() {
     return raw;
   }
@@ -147,6 +177,22 @@ public class QueueDto extends BaseDto {
 
   public void setSeed(String seed) {
     this.seed = seed;
+  }
+
+  public Long getIndex() {
+    return index;
+  }
+
+  public void setIndex(Long index) {
+    this.index = index;
+  }
+
+  public String getPrivateKey() {
+    return privateKey;
+  }
+
+  public void setPrivateKey(String privateKey) {
+    this.privateKey = privateKey;
   }
 
   public Date getTimestamp() {

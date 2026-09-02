@@ -14,6 +14,10 @@ import java.util.Optional;
 import java.util.function.Consumer;
 import org.bson.types.ObjectId;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Service;
 
 @Service
@@ -21,11 +25,17 @@ public class CurrenciesServiceImpl implements CurrenciesService {
 
   private CurrenciesRepository currenciesRepository;
 
+  private final MongoTemplate mongoTemplate;
+
   private final FileLogger fileLogger;
 
-  public CurrenciesServiceImpl(CurrenciesRepository currenciesRepository) {
+  public CurrenciesServiceImpl(
+    CurrenciesRepository currenciesRepository,
+    MongoTemplate mongoTemplate
+  ) {
     this.fileLogger = new FileLogger("CurrenciesService");
     this.currenciesRepository = currenciesRepository;
+    this.mongoTemplate = mongoTemplate;
   }
 
   @Override
@@ -82,6 +92,69 @@ public class CurrenciesServiceImpl implements CurrenciesService {
       }
     }
     return null;
+  }
+
+  @Override
+  public String validateMinimumAmount(
+    CurrencyDto currency,
+    String raw,
+    String minimumRaw,
+    String action
+  ) {
+    if (
+      currency == null ||
+      !StringUtil.isValidString(raw) ||
+      !StringUtil.isValidString(minimumRaw)
+    ) {
+      return null;
+    }
+
+    BigDecimal amount;
+    BigDecimal minimum;
+    try {
+      amount = new BigDecimal(raw);
+      minimum = new BigDecimal(minimumRaw);
+    } catch (NumberFormatException e) {
+      return null;
+    }
+
+    // Zero passes, matching how the transfer commands treat item-only transfers.
+    if (amount.signum() == 0 || amount.compareTo(minimum) >= 0) {
+      return null;
+    }
+
+    int precision = Integer.parseInt(currency.getPrecision());
+    return String.format(
+      "%s of %s %s is smaller than the minimum of %s %s.",
+      action,
+      getCurrencyDecimalValue(raw, precision),
+      currency.getTicker(),
+      getCurrencyDecimalValue(minimumRaw, precision),
+      currency.getTicker()
+    );
+  }
+
+  @Override
+  public String getEffectiveMinimumWithdraw(CurrencyDto currency) {
+    if (currency == null) {
+      return null;
+    }
+    String minimum = currency.getMinimumWithdraw();
+    if (!StringUtil.isValidString(minimum)) {
+      return minimum;
+    }
+    String fee = currency.getFeeEstimate();
+    if (!StringUtil.isValidString(fee)) {
+      return minimum;
+    }
+    try {
+      return new BigDecimal(minimum)
+        .add(new BigDecimal(fee))
+        .toBigIntegerExact()
+        .toString();
+    } catch (ArithmeticException | NumberFormatException e) {
+      return minimum;
+    }
   }
 
   @Override
@@ -178,6 +251,7 @@ public class CurrenciesServiceImpl implements CurrenciesService {
           currency.setName(currencyDto.getName());
           currency.setAddress(currencyDto.getAddress());
           currency.setNodeUrl(currencyDto.getNodeUrl());
+          currency.setWebsocketUrl(currencyDto.getWebsocketUrl());
           currency.setEnabled(currencyDto.getEnabled());
           currency.setProcessDeposits(currencyDto.getProcessDeposits());
           currency.setProcessWithdrawals(currencyDto.getProcessWithdrawals());
@@ -195,6 +269,22 @@ public class CurrenciesServiceImpl implements CurrenciesService {
           currency.setMinimumDrop(currencyDto.getMinimumDrop());
           currency.setMinimumGift(currencyDto.getMinimumGift());
           currency.setMinimumRain(currencyDto.getMinimumRain());
+          currency.setProtocol(currencyDto.getProtocol());
+          currency.setConfirmations(currencyDto.getConfirmations());
+          currency.setExplorerAccountUrl(currencyDto.getExplorerAccountUrl());
+          currency.setExplorerTxUrl(currencyDto.getExplorerTxUrl());
+          currency.setAddressFormat(currencyDto.getAddressFormat());
+          currency.setFeeEstimate(currencyDto.getFeeEstimate());
+          currency.setFeePriority(currencyDto.getFeePriority());
+          currency.setConcealBalances(currencyDto.getConcealBalances());
+          currency.setSupportsRepresentative(
+            currencyDto.getSupportsRepresentative()
+          );
+          // walletRpcUrl, walletRpcUser, walletRpcPassword, priceId and
+          // lastScannedHeight are deliberately absent from CurrencyDto and so
+          // are never touched here. The credentials must not reach the Discord
+          // frontend, and the scan cursor is written via
+          // updateLastScannedHeight instead.
 
           CurrencyEntity updatedCurrency = currenciesRepository.save(currency);
           fileLogger.info("Currency updated with ID: " + id);
@@ -207,6 +297,42 @@ public class CurrenciesServiceImpl implements CurrenciesService {
       }
     }
     return Optional.empty();
+  }
+
+  @Override
+  public boolean updateChainState(
+    String id,
+    String liquidity,
+    String feeEstimate,
+    String lastScannedHeight
+  ) {
+    if (id == null) {
+      return false;
+    }
+    Update update = new Update();
+    if (liquidity != null) {
+      update.set("liquidity", liquidity);
+    }
+    if (feeEstimate != null) {
+      update.set("feeEstimate", feeEstimate);
+    }
+    if (lastScannedHeight != null) {
+      update.set("lastScannedHeight", lastScannedHeight);
+    }
+    if (!update.getUpdateObject().containsKey("$set")) {
+      return false;
+    }
+    try {
+      mongoTemplate.updateFirst(
+        Query.query(Criteria.where("_id").is(id)),
+        update,
+        CurrencyEntity.class
+      );
+      return true;
+    } catch (Exception e) {
+      fileLogger.error("Error updating chain state: " + e.getMessage());
+      return false;
+    }
   }
 
   @Override

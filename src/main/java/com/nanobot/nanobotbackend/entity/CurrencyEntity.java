@@ -1,7 +1,9 @@
 package com.nanobot.nanobotbackend.entity;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.nanobot.nanobotbackend.dto.CurrencyDto;
 import com.nanobot.nanobotbackend.dto.StatusDto;
+import com.nanobot.nanobotbackend.util.Constants;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
@@ -16,6 +18,33 @@ public class CurrencyEntity extends BaseEntity {
   private String address;
 
   private String nodeUrl;
+
+  /**
+   * Node websocket endpoint for confirmation notifications, for example
+   * {@code ws://nano-node:7078}.
+   *
+   * <p>Left unset the currency falls back to polling the node on every cron
+   * tick, which is what every Nano fork did before push notifications existed.
+   * Treating null as "keep the old behaviour" is what lets this be enabled one
+   * currency at a time rather than everywhere at once.
+   */
+  private String websocketUrl;
+
+  private String protocol;
+
+  // GET /currencies serializes this entity directly rather than a DTO, and the
+  // Discord frontend polls that endpoint. These three gate a spend-capable
+  // wallet RPC, so they must never appear in a response body. Mongo mapping uses
+  // field access and is unaffected; the controller only accepts CurrencyDto on
+  // writes, so ignoring these for deserialization costs nothing.
+  @JsonIgnore
+  private String walletRpcUrl;
+
+  @JsonIgnore
+  private String walletRpcUser;
+
+  @JsonIgnore
+  private String walletRpcPassword;
 
   private boolean enabled;
 
@@ -51,6 +80,41 @@ public class CurrencyEntity extends BaseEntity {
 
   private String minimumRain;
 
+  private String confirmations;
+
+  private String lastScannedHeight;
+
+  private String priceId;
+
+  private String explorerAccountUrl;
+
+  private String explorerTxUrl;
+
+  private String addressFormat;
+
+  /**
+   * Current network fee estimate in raw units, refreshed from the chain.
+   *
+   * <p>Deliberately separate from minimumWithdraw rather than folded into it.
+   * Adding the fee to the stored minimum on every refresh would compound, so the
+   * minimum would climb without bound. Keeping them apart preserves the
+   * configured policy floor, and the effective minimum is the sum of the two.
+   */
+  private String feeEstimate;
+
+  /** Monero transaction priority, 1 (low) through 4 (highest). */
+  private String feePriority;
+
+  /**
+   * Whether holdings of this currency are withheld from the public audit.
+   *
+   * <p>Set for privacy coins, where publishing exact balances works against the
+   * point of the chain. A privileged audit still shows the real figures.
+   */
+  private Boolean concealBalances;
+
+  private Boolean supportsRepresentative;
+
   public CurrencyEntity() {
     super();
   }
@@ -61,6 +125,8 @@ public class CurrencyEntity extends BaseEntity {
     this.name = dto.getName();
     this.address = dto.getAddress();
     this.nodeUrl = dto.getNodeUrl();
+    this.websocketUrl = dto.getWebsocketUrl();
+    this.protocol = dto.getProtocol();
     this.enabled = dto.getEnabled();
     this.processDeposits = dto.getProcessDeposits();
     this.processWithdrawals = dto.getProcessWithdrawals();
@@ -78,6 +144,14 @@ public class CurrencyEntity extends BaseEntity {
     this.minimumDrop = dto.getMinimumDrop();
     this.minimumGift = dto.getMinimumGift();
     this.minimumRain = dto.getMinimumRain();
+    this.confirmations = dto.getConfirmations();
+    this.explorerAccountUrl = dto.getExplorerAccountUrl();
+    this.explorerTxUrl = dto.getExplorerTxUrl();
+    this.addressFormat = dto.getAddressFormat();
+    this.feeEstimate = dto.getFeeEstimate();
+    this.feePriority = dto.getFeePriority();
+    this.concealBalances = dto.getConcealBalances();
+    this.supportsRepresentative = dto.getSupportsRepresentative();
   }
 
   public String getTicker() {
@@ -110,6 +184,14 @@ public class CurrencyEntity extends BaseEntity {
 
   public void setNodeUrl(String nodeUrl) {
     this.nodeUrl = nodeUrl;
+  }
+
+  public String getWebsocketUrl() {
+    return websocketUrl;
+  }
+
+  public void setWebsocketUrl(String websocketUrl) {
+    this.websocketUrl = websocketUrl;
   }
 
   public boolean getEnabled() {
@@ -246,5 +328,131 @@ public class CurrencyEntity extends BaseEntity {
 
   public void setMinimumRain(String minimumRain) {
     this.minimumRain = minimumRain;
+  }
+
+  /**
+   * Resolves to NANO when unset. Currency documents created before Monero
+   * support existed have no protocol field, and they are all Nano forks.
+   */
+  public String getProtocol() {
+    return (protocol == null || protocol.isBlank())
+      ? Constants.PROTOCOL_NANO
+      : protocol;
+  }
+
+  public void setProtocol(String protocol) {
+    this.protocol = protocol;
+  }
+
+  public String getWalletRpcUrl() {
+    return walletRpcUrl;
+  }
+
+  public void setWalletRpcUrl(String walletRpcUrl) {
+    this.walletRpcUrl = walletRpcUrl;
+  }
+
+  public String getWalletRpcUser() {
+    return walletRpcUser;
+  }
+
+  public void setWalletRpcUser(String walletRpcUser) {
+    this.walletRpcUser = walletRpcUser;
+  }
+
+  public String getWalletRpcPassword() {
+    return walletRpcPassword;
+  }
+
+  public void setWalletRpcPassword(String walletRpcPassword) {
+    this.walletRpcPassword = walletRpcPassword;
+  }
+
+  public String getConfirmations() {
+    return confirmations;
+  }
+
+  public void setConfirmations(String confirmations) {
+    this.confirmations = confirmations;
+  }
+
+  public String getLastScannedHeight() {
+    return lastScannedHeight;
+  }
+
+  public void setLastScannedHeight(String lastScannedHeight) {
+    this.lastScannedHeight = lastScannedHeight;
+  }
+
+  public String getPriceId() {
+    return priceId;
+  }
+
+  public void setPriceId(String priceId) {
+    this.priceId = priceId;
+  }
+
+  public String getExplorerAccountUrl() {
+    return explorerAccountUrl;
+  }
+
+  public void setExplorerAccountUrl(String explorerAccountUrl) {
+    this.explorerAccountUrl = explorerAccountUrl;
+  }
+
+  public String getExplorerTxUrl() {
+    return explorerTxUrl;
+  }
+
+  public void setExplorerTxUrl(String explorerTxUrl) {
+    this.explorerTxUrl = explorerTxUrl;
+  }
+
+  public String getAddressFormat() {
+    return addressFormat;
+  }
+
+  public void setAddressFormat(String addressFormat) {
+    this.addressFormat = addressFormat;
+  }
+
+  public String getFeeEstimate() {
+    return feeEstimate;
+  }
+
+  public void setFeeEstimate(String feeEstimate) {
+    this.feeEstimate = feeEstimate;
+  }
+
+  public String getFeePriority() {
+    return feePriority;
+  }
+
+  public void setFeePriority(String feePriority) {
+    this.feePriority = feePriority;
+  }
+
+  /** Defaults to false so existing currencies stay publicly auditable. */
+  public Boolean getConcealBalances() {
+    return concealBalances == null ? Boolean.FALSE : concealBalances;
+  }
+
+  public void setConcealBalances(Boolean concealBalances) {
+    this.concealBalances = concealBalances;
+  }
+
+  /**
+   * Resolves to true when unset. Nano and Banano documents predate this field
+   * and do support representatives, so a missing value must not disable
+   * /update for them.
+   */
+  public Boolean getSupportsRepresentative() {
+    return supportsRepresentative == null
+      ? Boolean.TRUE
+      : supportsRepresentative;
+  }
+
+  public void setSupportsRepresentative(Boolean supportsRepresentative) {
+    this.supportsRepresentative = supportsRepresentative;
   }
 }

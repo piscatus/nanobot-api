@@ -10,12 +10,16 @@ import com.nanobot.nanobotbackend.dto.TransferResponseDto;
 import com.nanobot.nanobotbackend.dto.WalletDto;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;
+import com.nanobot.nanobotbackend.service.chain.ChainAdapter;
+import com.nanobot.nanobotbackend.service.chain.ChainAdapterRegistry;
 import com.nanobot.nanobotbackend.util.Constants;
 import com.nanobot.nanobotbackend.util.CryptoUtil;
 import com.nanobot.nanobotbackend.util.LoggingUtil;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Pattern;
@@ -41,6 +45,9 @@ public class SendServicesImpl implements SendServices {
   @Autowired
   private TransferExecutorService transferExecutorService;
 
+  @Autowired
+  private ChainAdapterRegistry chainAdapterRegistry;
+
   public SendServicesImpl(
     CoreServices coreServices,
     CurrenciesService currenciesService,
@@ -53,6 +60,115 @@ public class SendServicesImpl implements SendServices {
     this.creaturesService = creaturesService;
     this.queuesService = queuesService;
     this.transferService = transferService;
+  }
+
+  /**
+   * Error message when a fee-bearing currency has no usable fee estimate, or
+   * null when the withdrawal may proceed.
+   *
+   * <p>Asks the adapter rather than the currency document, because whether a
+   * network charges a fee is a property of the protocol and not something an
+   * administrator should be able to get wrong by editing a field.
+   */
+  private String validateFeeEstimateAvailable(CurrencyDto currencyDto) {
+    boolean feeBearing = chainAdapterRegistry
+      .getByProtocol(currencyDto.getProtocol())
+      .map(ChainAdapter::hasNetworkFee)
+      // No adapter means the currency cannot be sent at all; that is reported
+      // elsewhere, so this stays out of the way.
+      .orElse(false);
+    if (!feeBearing) {
+      return null;
+    }
+
+    String feeEstimate = currencyDto.getFeeEstimate();
+    boolean usable = false;
+    if (feeEstimate != null && !feeEstimate.isBlank()) {
+      try {
+        usable = new BigInteger(feeEstimate.trim()).signum() > 0;
+      } catch (NumberFormatException e) {
+        usable = false;
+      }
+    }
+    if (usable) {
+      return null;
+    }
+
+    return (
+      "### The current network fee for " +
+      currencyDto.getName() +
+      " (" +
+      currencyDto.getTicker() +
+      ") is not available right now, so withdrawals are paused.\n" +
+      "-# This usually clears within a minute. Please try again shortly."
+    );
+  }
+
+  /**
+   * Reverses a withdrawal debit whose queue entry could not be created, and
+   * returns the message to show the user.
+   *
+   * <p>The debit and the queue insert are two separate writes, and nothing
+   * downstream can repair a debit with no queue entry behind it: the chain
+   * adapters only ever look at queued work, so the balance would simply be gone
+   * with no record that anything was owed. Compensating immediately is the only
+   * point at which enough context still exists to put it back.
+   *
+   * <p>Safe to do unconditionally here because the queue entry is what causes a
+   * send to happen at all. No entry means nothing was, or ever will be,
+   * broadcast.
+   */
+  private String returnDebitedFunds(String userId, WalletDto debited) {
+    TransferResponseDto refundResponse = new TransferResponseDto();
+    coreServices.commandsService.setCommands(
+      Constants.COMMAND_NAME_RECEIVE,
+      userId,
+      refundResponse::setCommands
+    );
+
+    List<WalletDto> wallets = new ArrayList<>();
+    wallets.add(new WalletDto(debited.getTicker(), debited.getRaw(), true));
+    refundResponse.setPrimaryTransfer(
+      new TransferDto(wallets, new ArrayList<>())
+    );
+
+    TransferResponseDto refund = transferExecutorService.executeTransfer(
+      Constants.COMMAND_NAME_RECEIVE,
+      null,
+      null,
+      "0",
+      null,
+      Collections.singletonList(userId),
+      null,
+      refundResponse
+    );
+
+    if (refund == null || refund.getTransactionId() == null) {
+      LoggingUtil.errorLogging(
+        Constants.COMMAND_NAME_SEND,
+        new IllegalStateException(
+          "Could not return " +
+          debited.getRaw() +
+          " " +
+          debited.getTicker() +
+          " to user " +
+          userId +
+          " after the withdrawal failed to queue; the balance is still debited " +
+          "and needs manual correction."
+        )
+      );
+      return (
+        "### Something went wrong setting up your withdrawal, and your balance " +
+        "could not be restored automatically.\n" +
+        "Please contact support so it can be corrected:\n" +
+        System.getenv("HOME_SERVER_INVITE_URL")
+      );
+    }
+
+    return (
+      "### Something went wrong setting up your withdrawal, so it was not sent.\n" +
+      "-# Your funds have been returned to your balance. Please try again."
+    );
   }
 
   @Override
@@ -110,6 +226,19 @@ public class SendServicesImpl implements SendServices {
         if (
           Pattern.matches(currencyDto.getAddress(), requestDto.getAddress())
         ) {
+          // Only an explicit false disables this. Unset means supported, which
+          // keeps currency documents predating the field working and avoids
+          // silently disabling /update for Nano and Banano.
+          if (Boolean.FALSE.equals(currencyDto.getSupportsRepresentative())) {
+            transferResponseDto.setErrorMessage(
+              "### " +
+              currencyDto.getName() +
+              " (" +
+              currencyDto.getTicker() +
+              ") does not use representatives, so there is nothing to update."
+            );
+            return transferResponseDto;
+          }
           if (!currencyDto.getProcessWithdrawals()) {
             transferResponseDto.setErrorMessage(
               "### Representative updates are currently disabled for " +
@@ -140,8 +269,8 @@ public class SendServicesImpl implements SendServices {
             }
 
             UserDetailsEntity userDetails = userDetailsOptional.get();
-            String userAddress = CryptoUtil.deriveAddressFromSeed(
-              userDetails.getSeed(),
+            String userAddress = CryptoUtil.deriveAddress(
+              userDetails,
               currencyDto.getTicker()
             );
             isValidAddress = true;
@@ -158,6 +287,7 @@ public class SendServicesImpl implements SendServices {
               new Date(),
               null
             );
+            CryptoUtil.applySigningMaterial(queueDto, userDetails);
 
             QueueEntity queueEntity = queuesService.createQueue(queueDto);
             // Check that it was added successfully
@@ -283,12 +413,46 @@ public class SendServicesImpl implements SendServices {
               .getPrimaryTransfer()
               .getWallets()
               .get(0)
-              .getTicker()
-              .equalsIgnoreCase(currencyDto.getTicker())
+            .getTicker()
+            .equalsIgnoreCase(currencyDto.getTicker())
+        ) {
+          // Enforced here the way /gift enforces minimumGift. On a network with
+          // fees this is not just a policy floor: the fee is deducted from the
+          // amount sent, so a withdrawal smaller than the fee cannot be built at
+          // all, and the balance has already been debited by the time the send
+          // is attempted.
+          // Without an estimate the effective minimum silently collapses to the
+          // policy floor alone, which on a fee-bearing network lets through a
+          // withdrawal the fee will consume entirely. The balance is debited
+          // before the send is attempted, so that costs the user a failed
+          // withdrawal and a refund cycle rather than a clear rejection.
+          String feeError = validateFeeEstimateAvailable(currencyDto);
+          if (feeError != null) {
+            transferResponseDto.setErrorMessage(feeError);
+            return transferResponseDto;
+          }
+
+          String minimumError = currenciesService.validateMinimumAmount(
+            currencyDto,
+            transferResponseDto
+              .getPrimaryTransfer()
+              .getWallets()
+              .get(0)
+              .getRaw(),
+            currenciesService.getEffectiveMinimumWithdraw(currencyDto),
+            "Withdrawal"
+          );
+          if (minimumError != null) {
+            transferResponseDto.setErrorMessage(minimumError);
+            return transferResponseDto;
+          }
+          // Withdrawing to a Nanobot deposit address is allowed on purpose: it
+          // is a useful self-test, and one user may legitimately withdraw to
+          // another user's shared deposit address as an exchange. Chain adapters
+          // are responsible for crediting the recipient of such a transfer.
+          if (
+            Pattern.matches(currencyDto.getAddress(), requestDto.getAddress())
           ) {
-            if (
-              Pattern.matches(currencyDto.getAddress(), requestDto.getAddress())
-            ) {
               if (!currencyDto.getProcessWithdrawals()) {
                 transferResponseDto.setErrorMessage(
                   "### Withdrawals are currently disabled for " +
@@ -319,8 +483,8 @@ public class SendServicesImpl implements SendServices {
                     .orElse(null);
                   QueueDto queueDto = new QueueDto(
                     requestDto.getUserId(),
-                    CryptoUtil.deriveAddressFromSeed(
-                      botUserDetails.getSeed(),
+                    CryptoUtil.deriveAddress(
+                      botUserDetails,
                       transferDto.getWallets().get(0).getTicker()
                     ),
                     requestDto.getAddress(),
@@ -333,9 +497,27 @@ public class SendServicesImpl implements SendServices {
                     new Date(),
                     transfer.getTransactionId()
                   );
-                  QueueEntity queueEntity = queuesService.createQueue(queueDto);
-                  // Check that it was added successfully
+                  CryptoUtil.applySigningMaterial(queueDto, botUserDetails);
 
+                  // The balance is already gone by this point. If the queue
+                  // entry does not survive, nothing will ever send it and
+                  // nothing will ever refund it, so the debit has to be undone
+                  // here rather than left for someone to find.
+                  QueueEntity queueEntity = null;
+                  try {
+                    queueEntity = queuesService.createQueue(queueDto);
+                  } catch (Exception e) {
+                    LoggingUtil.errorLogging(Constants.COMMAND_NAME_SEND, e);
+                  }
+                  if (queueEntity == null) {
+                    transferResponseDto.setErrorMessage(
+                      returnDebitedFunds(
+                        requestDto.getUserId(),
+                        transferDto.getWallets().get(0)
+                      )
+                    );
+                    return transferResponseDto;
+                  }
                 } else {
                   transferResponseDto.setErrorMessage(
                     transfer.getErrorMessage()
@@ -347,10 +529,23 @@ public class SendServicesImpl implements SendServices {
                 return transferResponseDto;
               }
             } else {
+              // The regex is length-anchored per currency, so this also catches
+              // an address of the wrong length for the requested ticker. Quote
+              // the expected shape so the user can tell what went wrong.
+              String expectedFormat = currencyDto.getAddressFormat();
               transferResponseDto.setErrorMessage(
-                "Invalid Address: Please specify a valid address for " +
+                "Invalid Address: Please specify a valid " +
                 currencyDto.getName() +
-                "."
+                " (" +
+                currencyDto.getTicker() +
+                ") address." +
+                (expectedFormat == null || expectedFormat.isBlank()
+                    ? ""
+                    : "\n" +
+                    currencyDto.getName() +
+                    " addresses are " +
+                    expectedFormat +
+                    ".")
               );
               return transferResponseDto;
             }

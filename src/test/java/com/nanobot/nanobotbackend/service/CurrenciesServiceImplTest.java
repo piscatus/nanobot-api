@@ -41,6 +41,92 @@ class CurrenciesServiceImplTest {
     assertEquals("1.5", result);
   }
 
+  private CurrencyDto minimumTestCurrency() {
+    CurrencyDto currency = new CurrencyDto();
+    currency.setTicker("XMR");
+    currency.setName("Monero");
+    currency.setPrecision("12");
+    return currency;
+  }
+
+  @Test
+  void validateMinimumAmountRejectsAmountBelowMinimum() {
+    String error = currenciesService.validateMinimumAmount(
+      minimumTestCurrency(),
+      "100000000",
+      "1000000000",
+      "Withdrawal"
+    );
+
+    assertNotNull(error);
+    assertTrue(error.contains("0.0001 XMR"));
+    assertTrue(error.contains("0.001 XMR"));
+    assertTrue(error.contains("Withdrawal"));
+  }
+
+  @Test
+  void validateMinimumAmountAcceptsAmountExactlyAtMinimum() {
+    assertNull(
+      currenciesService.validateMinimumAmount(
+        minimumTestCurrency(),
+        "1000000000",
+        "1000000000",
+        "Withdrawal"
+      )
+    );
+  }
+
+  @Test
+  void validateMinimumAmountAcceptsAmountAboveMinimum() {
+    assertNull(
+      currenciesService.validateMinimumAmount(
+        minimumTestCurrency(),
+        "10000000000",
+        "1000000000",
+        "Withdrawal"
+      )
+    );
+  }
+
+  @Test
+  void validateMinimumAmountAllowsZeroToMatchTransferCommands() {
+    assertNull(
+      currenciesService.validateMinimumAmount(
+        minimumTestCurrency(),
+        "0",
+        "1000000000",
+        "Withdrawal"
+      )
+    );
+  }
+
+  @Test
+  void validateMinimumAmountIgnoresMissingOrUnparsableValues() {
+    CurrencyDto currency = minimumTestCurrency();
+    assertNull(
+      currenciesService.validateMinimumAmount(
+        currency,
+        null,
+        "1000000000",
+        "Withdrawal"
+      )
+    );
+    assertNull(
+      currenciesService.validateMinimumAmount(currency, "100", null, "Send")
+    );
+    assertNull(
+      currenciesService.validateMinimumAmount(
+        currency,
+        "not-a-number",
+        "1000000000",
+        "Send"
+      )
+    );
+    assertNull(
+      currenciesService.validateMinimumAmount(null, "100", "200", "Send")
+    );
+  }
+
   @Test
   void getCurrencyDollarValueMultipliesAndRoundsDownToEightDecimals() {
     String result = currenciesService.getCurrencyDollarValue("1.234567899", "3");

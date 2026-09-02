@@ -13,6 +13,10 @@ public class UserDetailsEntity extends BaseEntity {
 
   private String seed;
 
+  private Long index;
+
+  private String privateKey;
+
   @Indexed(unique = true)
   private String userId;
 
@@ -26,6 +30,8 @@ public class UserDetailsEntity extends BaseEntity {
     super(user.getId());
     this.status = user.getStatus();
     this.seed = user.getSeed();
+    this.index = user.getIndex();
+    this.privateKey = user.getPrivateKey();
     this.userId = user.getUserId();
     this.subordinateUserId = user.getSubordinateUserId();
   }
@@ -44,6 +50,22 @@ public class UserDetailsEntity extends BaseEntity {
 
   public void setSeed(String seed) {
     this.seed = seed;
+  }
+
+  public Long getIndex() {
+    return index;
+  }
+
+  public void setIndex(Long index) {
+    this.index = index;
+  }
+
+  public String getPrivateKey() {
+    return privateKey;
+  }
+
+  public void setPrivateKey(String privateKey) {
+    this.privateKey = privateKey;
   }
 
   public String getUserId() {

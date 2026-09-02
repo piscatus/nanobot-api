@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.data.mongodb.core.MongoTemplate;
 
 @ExtendWith(MockitoExtension.class)
 class QueuesServiceImplTest {
@@ -23,11 +24,14 @@ class QueuesServiceImplTest {
   @Mock
   private QueuesRepository queuesRepository;
 
+  @Mock
+  private MongoTemplate mongoTemplate;
+
   private QueuesServiceImpl queuesService;
 
   @BeforeEach
   void setUp() {
-    queuesService = new QueuesServiceImpl(queuesRepository);
+    queuesService = new QueuesServiceImpl(queuesRepository, mongoTemplate);
   }
 
   @Test
@@ -139,5 +143,80 @@ class QueuesServiceImplTest {
     assertTrue(result.isEmpty());
     verify(queuesRepository).findById("missing");
     verify(queuesRepository, never()).deleteById(any());
+  }
+
+  /**
+   * A SEND entry stores the hash of the block it published. When the bot sends
+   * to an address it custodies that hash is also the identity of the resulting
+   * deposit, so matching SEND entries here would throw the deposit away.
+   */
+  @Test
+  void isDepositQueuedShouldOnlyConsiderReceiveEntries() {
+    when(
+      queuesRepository.existsByTickerAndSourceHashAndLevel(
+        "XNO",
+        "HASH1",
+        LevelDto.RECEIVE
+      )
+    )
+      .thenReturn(false);
+    when(
+      queuesRepository.existsByTickerAndBlockHashAndLevel(
+        "XNO",
+        "HASH1",
+        LevelDto.RECEIVE
+      )
+    )
+      .thenReturn(false);
+
+    assertFalse(queuesService.isDepositQueued("XNO", "HASH1"));
+
+    verify(queuesRepository).existsByTickerAndSourceHashAndLevel(
+      "XNO",
+      "HASH1",
+      LevelDto.RECEIVE
+    );
+    verify(queuesRepository).existsByTickerAndBlockHashAndLevel(
+      "XNO",
+      "HASH1",
+      LevelDto.RECEIVE
+    );
+  }
+
+  @Test
+  void isDepositQueuedShouldMatchAnEntryQueuedBeforeSourceHashExisted() {
+    when(
+      queuesRepository.existsByTickerAndSourceHashAndLevel(
+        "XNO",
+        "HASH1",
+        LevelDto.RECEIVE
+      )
+    )
+      .thenReturn(false);
+    when(
+      queuesRepository.existsByTickerAndBlockHashAndLevel(
+        "XNO",
+        "HASH1",
+        LevelDto.RECEIVE
+      )
+    )
+      .thenReturn(true);
+
+    assertTrue(queuesService.isDepositQueued("XNO", "HASH1"));
+  }
+
+  /** A lookup failure must not be read as "this deposit is new". */
+  @Test
+  void isDepositQueuedShouldFailClosed() {
+    when(
+      queuesRepository.existsByTickerAndSourceHashAndLevel(
+        "XNO",
+        "HASH1",
+        LevelDto.RECEIVE
+      )
+    )
+      .thenThrow(new RuntimeException("mongo is down"));
+
+    assertTrue(queuesService.isDepositQueued("XNO", "HASH1"));
   }
 }

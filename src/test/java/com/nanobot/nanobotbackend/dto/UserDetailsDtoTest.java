@@ -15,6 +15,8 @@ class UserDetailsDtoTest {
     assertNull(dto.getSubordinateUserId());
     assertNull(dto.getStatus());
     assertNull(dto.getSeed());
+    assertNull(dto.getIndex());
+    assertNull(dto.getPrivateKey());
   }
 
   @Test
@@ -35,6 +37,8 @@ class UserDetailsDtoTest {
     entity.setUserId("u1");
     entity.setSubordinateUserId("sub1");
     entity.setSeed("secret");
+    entity.setIndex(7L);
+    entity.setPrivateKey("pk-hex");
     StatusDto status = StatusDto.ACTIVE;
     entity.setStatus(status);
 
@@ -44,16 +48,23 @@ class UserDetailsDtoTest {
     assertEquals("u1", dto.getUserId());
     assertEquals("sub1", dto.getSubordinateUserId());
     assertEquals("secret", dto.getSeed());
+    assertEquals(7L, dto.getIndex());
+    assertEquals("pk-hex", dto.getPrivateKey());
     assertEquals(status, dto.getStatus());
   }
 
   @Test
-  void removeSensitiveDataClearsSeed() {
+  void removeSensitiveDataClearsSeedAndPrivateKey() {
     UserDetailsDto dto = new UserDetailsDto("u1", "sub1", StatusDto.ACTIVE, "seed");
+    dto.setIndex(3L);
+    dto.setPrivateKey("pk-hex");
     assertEquals("seed", dto.getSeed());
+    assertEquals("pk-hex", dto.getPrivateKey());
 
     dto.removeSensitiveData();
     assertNull(dto.getSeed());
+    assertNull(dto.getPrivateKey());
+    assertEquals(3L, dto.getIndex());
   }
 
   @Test
@@ -65,10 +76,14 @@ class UserDetailsDtoTest {
     dto.setSubordinateUserId("sub2");
     dto.setStatus(status);
     dto.setSeed("new-seed");
+    dto.setIndex(9L);
+    dto.setPrivateKey("new-pk");
 
     assertEquals("u2", dto.getUserId());
     assertEquals("sub2", dto.getSubordinateUserId());
     assertEquals(status, dto.getStatus());
     assertEquals("new-seed", dto.getSeed());
+    assertEquals(9L, dto.getIndex());
+    assertEquals("new-pk", dto.getPrivateKey());
   }
 }

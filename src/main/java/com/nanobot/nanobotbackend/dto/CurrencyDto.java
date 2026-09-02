@@ -12,6 +12,11 @@ public class CurrencyDto extends BaseDto {
 
   private String nodeUrl;
 
+  /** Node websocket endpoint. Null keeps the currency on poll-only detection. */
+  private String websocketUrl;
+
+  private String protocol;
+
   private boolean enabled;
 
   private boolean processDeposits;
@@ -46,6 +51,24 @@ public class CurrencyDto extends BaseDto {
 
   private String minimumRain;
 
+  private String confirmations;
+
+  private String explorerAccountUrl;
+
+  private String explorerTxUrl;
+
+  private String addressFormat;
+
+  /** Network fee estimate in raw units. Shown so users see the true floor. */
+  private String feeEstimate;
+
+  private String feePriority;
+
+  /** Whether holdings of this currency are withheld from the public audit. */
+  private Boolean concealBalances;
+
+  private Boolean supportsRepresentative;
+
   public CurrencyDto() {
     super();
   }
@@ -56,6 +79,8 @@ public class CurrencyDto extends BaseDto {
     this.name = entity.getName();
     this.address = entity.getAddress();
     this.nodeUrl = entity.getNodeUrl();
+    this.websocketUrl = entity.getWebsocketUrl();
+    this.protocol = entity.getProtocol();
     this.enabled = entity.getEnabled();
     this.processDeposits = entity.getProcessDeposits();
     this.processWithdrawals = entity.getProcessWithdrawals();
@@ -73,6 +98,14 @@ public class CurrencyDto extends BaseDto {
     this.minimumDrop = entity.getMinimumDrop();
     this.minimumGift = entity.getMinimumGift();
     this.minimumRain = entity.getMinimumRain();
+    this.confirmations = entity.getConfirmations();
+    this.explorerAccountUrl = entity.getExplorerAccountUrl();
+    this.explorerTxUrl = entity.getExplorerTxUrl();
+    this.addressFormat = entity.getAddressFormat();
+    this.feeEstimate = entity.getFeeEstimate();
+    this.feePriority = entity.getFeePriority();
+    this.concealBalances = entity.getConcealBalances();
+    this.supportsRepresentative = entity.getSupportsRepresentative();
   }
 
   public CurrencyDto(
@@ -170,6 +203,14 @@ public class CurrencyDto extends BaseDto {
 
   public void setNodeUrl(String nodeUrl) {
     this.nodeUrl = nodeUrl;
+  }
+
+  public String getWebsocketUrl() {
+    return websocketUrl;
+  }
+
+  public void setWebsocketUrl(String websocketUrl) {
+    this.websocketUrl = websocketUrl;
   }
 
   public boolean getEnabled() {
@@ -306,5 +347,77 @@ public class CurrencyDto extends BaseDto {
 
   public void setMinimumRain(String minimumRain) {
     this.minimumRain = minimumRain;
+  }
+
+  public String getProtocol() {
+    return protocol;
+  }
+
+  public void setProtocol(String protocol) {
+    this.protocol = protocol;
+  }
+
+  public String getConfirmations() {
+    return confirmations;
+  }
+
+  public void setConfirmations(String confirmations) {
+    this.confirmations = confirmations;
+  }
+
+  public String getExplorerAccountUrl() {
+    return explorerAccountUrl;
+  }
+
+  public void setExplorerAccountUrl(String explorerAccountUrl) {
+    this.explorerAccountUrl = explorerAccountUrl;
+  }
+
+  public String getExplorerTxUrl() {
+    return explorerTxUrl;
+  }
+
+  public void setExplorerTxUrl(String explorerTxUrl) {
+    this.explorerTxUrl = explorerTxUrl;
+  }
+
+  public String getAddressFormat() {
+    return addressFormat;
+  }
+
+  public void setAddressFormat(String addressFormat) {
+    this.addressFormat = addressFormat;
+  }
+
+  public String getFeeEstimate() {
+    return feeEstimate;
+  }
+
+  public void setFeeEstimate(String feeEstimate) {
+    this.feeEstimate = feeEstimate;
+  }
+
+  public String getFeePriority() {
+    return feePriority;
+  }
+
+  public void setFeePriority(String feePriority) {
+    this.feePriority = feePriority;
+  }
+
+  public Boolean getConcealBalances() {
+    return concealBalances;
+  }
+
+  public void setConcealBalances(Boolean concealBalances) {
+    this.concealBalances = concealBalances;
+  }
+
+  public Boolean getSupportsRepresentative() {
+    return supportsRepresentative;
+  }
+
+  public void setSupportsRepresentative(Boolean supportsRepresentative) {
+    this.supportsRepresentative = supportsRepresentative;
   }
 }

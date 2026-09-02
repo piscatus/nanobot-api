@@ -28,7 +28,22 @@ public class RequestDto extends BaseDto {
 
   private List<String> receiverIds;
 
+  /**
+   * Optional currency ticker narrowing a request to a single currency. Set by
+   * the fishing command when the user picks a currency, so the catch is drawn
+   * only from that currency's creatures. Absent from the constructor so the
+   * existing call sites keep compiling; Jackson binds it through the setter.
+   */
+  private String ticker;
+
   private String userId;
+
+  /**
+   * Display name of the requesting user. Stored on a drop so the closing embed
+   * can name the creator even when Discord has not cached the member and a
+   * mention renders as a raw id.
+   */
+  private String username;
 
   private List<String> userIdsWithRole;
 
@@ -168,12 +183,28 @@ public class RequestDto extends BaseDto {
     this.receiverIds = receiverIds;
   }
 
+  public String getTicker() {
+    return ticker;
+  }
+
+  public void setTicker(String ticker) {
+    this.ticker = ticker;
+  }
+
   public String getUserId() {
     return userId;
   }
 
   public void setUserId(String userId) {
     this.userId = userId;
+  }
+
+  public String getUsername() {
+    return username;
+  }
+
+  public void setUsername(String username) {
+    this.username = username;
   }
 
   public List<String> getUserIdsWithRole() {

@@ -19,6 +19,8 @@ import com.nanobot.nanobotbackend.dto.UserDetailsDto;
 import com.nanobot.nanobotbackend.dto.WalletDto;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;
+import com.nanobot.nanobotbackend.service.chain.ChainAdapter;
+import com.nanobot.nanobotbackend.service.chain.ChainAdapterRegistry;
 import com.nanobot.nanobotbackend.util.Constants;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -64,6 +66,9 @@ class SendServicesImplTest {
   @Mock
   private TransferExecutorService transferExecutorService;
 
+  @Mock
+  private ChainAdapterRegistry chainAdapterRegistry;
+
   private SendServicesImpl sendServices;
 
   @BeforeEach
@@ -86,6 +91,12 @@ class SendServicesImplTest {
     );
     executorField.setAccessible(true);
     executorField.set(sendServices, transferExecutorService);
+
+    Field registryField = SendServicesImpl.class.getDeclaredField(
+      "chainAdapterRegistry"
+    );
+    registryField.setAccessible(true);
+    registryField.set(sendServices, chainAdapterRegistry);
   }
 
   @Test
@@ -141,7 +152,7 @@ class SendServicesImplTest {
     TransferResponseDto result = sendServices.send(sendRequest(true, "not-a-nano-address"));
 
     assertNotNull(result.getErrorMessage());
-    assertTrue(result.getErrorMessage().contains("valid address for Nano"));
+    assertTrue(result.getErrorMessage().contains("valid Nano (XNO) address"));
     verify(transferExecutorService, never())
       .executeTransfer(anyString(), anyString(), anyString(), anyString(), any(), any(), any(), any());
   }
@@ -203,6 +214,110 @@ class SendServicesImplTest {
     assertEquals("XNO", queueCaptor.getValue().getTicker());
     assertEquals(VALID_NANO_ADDRESS, queueCaptor.getValue().getTargetAddress());
     assertEquals("tx-1", queueCaptor.getValue().getTransactionId());
+  }
+
+  /**
+   * Without an estimate the effective minimum quietly drops to the policy floor
+   * alone, which on a fee-bearing network accepts a withdrawal the fee will eat.
+   * Refusing up front beats debiting the user and refunding them later.
+   */
+  @Test
+  void sendRejectsFeeBearingCurrencyWithNoFeeEstimate() {
+    stubCoreAccess("user-1");
+    stubCurrencies(true);
+    stubCreatures();
+    when(
+      transferService.processInputs(
+        anyString(),
+        any(),
+        any(),
+        anyString(),
+        anyString(),
+        anyString(),
+        anyBoolean()
+      )
+    )
+      .thenReturn(transferWithWallet("XNO", "25"));
+    when(userDetailsService.getUserDetailsByUserId(any()))
+      .thenReturn(Optional.of(botUser("0")));
+
+    ChainAdapter feeBearing = mock(ChainAdapter.class);
+    when(feeBearing.hasNetworkFee()).thenReturn(true);
+    when(chainAdapterRegistry.getByProtocol(any()))
+      .thenReturn(Optional.of(feeBearing));
+
+    TransferResponseDto result = sendServices.send(
+      sendRequest(true, VALID_NANO_ADDRESS)
+    );
+
+    assertNotNull(result.getErrorMessage());
+    assertTrue(result.getErrorMessage().contains("network fee"));
+    verify(transferExecutorService, never())
+      .executeTransfer(anyString(), anyString(), anyString(), anyString(), any(), any(), any(), any());
+    verify(queuesService, never()).createQueue(any());
+  }
+
+  /**
+   * The debit and the queue insert are separate writes. If the second one does
+   * not land, nothing downstream will ever send or refund the withdrawal, so
+   * the balance has to be put back here.
+   */
+  @Test
+  void sendReturnsTheDebitWhenTheQueueEntryCannotBeCreated() {
+    stubCoreAccess("user-1");
+    stubCurrencies(true);
+    stubCreatures();
+    when(
+      transferService.processInputs(
+        anyString(),
+        any(),
+        any(),
+        anyString(),
+        anyString(),
+        anyString(),
+        anyBoolean()
+      )
+    )
+      .thenReturn(transferWithWallet("XNO", "55"));
+    when(userDetailsService.getUserDetailsByUserId(any()))
+      .thenReturn(Optional.of(botUser("0")));
+
+    TransferResponseDto executed = new TransferResponseDto();
+    executed.setCompletedPrimaryTransfers(
+      Optional.of(Map.of("0", transferWithWallet("XNO", "55")))
+    );
+    executed.setTransactionId("tx-1");
+
+    TransferResponseDto refunded = new TransferResponseDto();
+    refunded.setTransactionId("refund-1");
+
+    when(transferExecutorService.executeTransfer(anyString(), any(), any(), anyString(), any(), any(), any(), any()))
+      .thenReturn(executed)
+      .thenReturn(refunded);
+
+    when(queuesService.createQueue(any())).thenReturn(null);
+
+    TransferResponseDto result = sendServices.send(
+      sendRequest(true, VALID_NANO_ADDRESS)
+    );
+
+    assertNotNull(result.getErrorMessage());
+    assertTrue(result.getErrorMessage().contains("returned to your balance"));
+
+    // The debit, then the compensating credit back from the system account.
+    ArgumentCaptor<String> senderCaptor = ArgumentCaptor.forClass(String.class);
+    verify(transferExecutorService, times(2))
+      .executeTransfer(
+        anyString(),
+        any(),
+        any(),
+        senderCaptor.capture(),
+        any(),
+        any(),
+        any(),
+        any()
+      );
+    assertEquals(List.of("user-1", "0"), senderCaptor.getAllValues());
   }
 
   @Test

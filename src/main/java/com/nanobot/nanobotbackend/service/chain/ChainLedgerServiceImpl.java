@@ -1,0 +1,412 @@
+package com.nanobot.nanobotbackend.service.chain;
+
+import com.nanobot.nanobotbackend.dto.MessageDto;
+import com.nanobot.nanobotbackend.dto.TransferDto;
+import com.nanobot.nanobotbackend.dto.TransferResponseDto;
+import com.nanobot.nanobotbackend.dto.WalletDto;
+import com.nanobot.nanobotbackend.entity.CurrencyEntity;
+import com.nanobot.nanobotbackend.entity.QueueEntity;
+import com.nanobot.nanobotbackend.service.CoreServices;
+import com.nanobot.nanobotbackend.service.CurrenciesService;
+import com.nanobot.nanobotbackend.service.MessagesService;
+import com.nanobot.nanobotbackend.service.TransactionsService;
+import com.nanobot.nanobotbackend.service.TransferExecutorService;
+import com.nanobot.nanobotbackend.task.FileLogger;
+import com.nanobot.nanobotbackend.util.Constants;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ChainLedgerServiceImpl implements ChainLedgerService {
+
+  private static final String URL_PLACEHOLDER = "{value}";
+  private static final String CONFIRMED_NOTE =
+    "has been *confirmed* on the network!";
+
+  private final CoreServices coreServices;
+  private final CurrenciesService currenciesService;
+  private final MessagesService messagesService;
+  private final TransactionsService transactionsService;
+  private final FileLogger fileLogger;
+
+  @Autowired
+  private TransferExecutorService transferExecutorService;
+
+  public ChainLedgerServiceImpl(
+    CoreServices coreServices,
+    CurrenciesService currenciesService,
+    MessagesService messagesService,
+    TransactionsService transactionsService
+  ) {
+    this.coreServices = coreServices;
+    this.currenciesService = currenciesService;
+    this.messagesService = messagesService;
+    this.transactionsService = transactionsService;
+    this.fileLogger = new FileLogger("ChainLedgerService");
+  }
+
+  @Override
+  public String creditDeposit(
+    CurrencyEntity currencyEntity,
+    String userId,
+    String raw,
+    String txid,
+    String depositAddress,
+    Map<String, String> commandMap
+  ) {
+    TransferResponseDto transferResponseDto = new TransferResponseDto();
+    coreServices.commandsService.setCommands(
+      Constants.COMMAND_NAME_RECEIVE,
+      userId,
+      transferResponseDto::setCommands
+    );
+
+    List<WalletDto> wallets = new ArrayList<>();
+    wallets.add(new WalletDto(currencyEntity.getTicker(), raw, true));
+    transferResponseDto.setPrimaryTransfer(
+      new TransferDto(wallets, new ArrayList<>())
+    );
+    transferResponseDto.setBlockHash(txid);
+
+    // "0" is the system account: crediting from it mints into the user's
+    // balance, mirroring how the Nano path books a confirmed deposit.
+    TransferResponseDto transfer = transferExecutorService.executeTransfer(
+      Constants.COMMAND_NAME_RECEIVE,
+      null,
+      null,
+      "0",
+      null,
+      Collections.singletonList(userId),
+      null,
+      transferResponseDto
+    );
+
+    if (transfer == null || transfer.getTransactionId() == null) {
+      fileLogger.error(
+        "Deposit transfer failed for user " +
+        userId +
+        " on " +
+        currencyEntity.getTicker() +
+        " tx " +
+        txid
+      );
+      return null;
+    }
+
+    String decimalValue = currenciesService.getCurrencyDecimalValue(
+      raw,
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
+    String footer = "Nanobot Transaction ID " + transfer.getTransactionId();
+    String title = "🧾 Deposit Confirmed";
+
+    String header =
+      "<@" + userId + ">'s deposit " + CONFIRMED_NOTE + "\n";
+
+    String commandNote =
+      "\n-# Use </transactions:" +
+      commandMap.get("transactions") +
+      "> to view your transaction history." +
+      "\n-# Use </wallet:" +
+      commandMap.get("wallet") +
+      "> to view your *updated* currency balances.\n";
+
+    String body =
+      "### 💼 __Wallet Credits__\n> **" +
+      decimalValue +
+      " " +
+      currencyEntity.getTicker() +
+      "** (≈$" +
+      currenciesService.getCurrencyDollarValue(
+        decimalValue,
+        currencyEntity.getValue()
+      ) +
+      ") " +
+      currencyEntity.getEmoji() +
+      "\n### 🏠︎ __Deposit Address__\n> `" +
+      depositAddress +
+      "`\n### 🔗 __Transaction__\n> `" +
+      txid +
+      "`";
+
+    String url = explorerTxUrl(currencyEntity, txid);
+
+    messagesService.createMessage(
+      new MessageDto(
+        null,
+        System.getenv("HOME_SERVER_ID"),
+        System.getenv("DEPOSIT_LOGGING_CHANNEL_ID"),
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + body,
+        new Date(),
+        url,
+        null,
+        footer
+      )
+    );
+
+    messagesService.createMessage(
+      new MessageDto(
+        userId,
+        null,
+        null,
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + commandNote + body,
+        new Date(),
+        url,
+        null,
+        footer
+      )
+    );
+
+    return transfer.getTransactionId();
+  }
+
+  @Override
+  public void notifyWithdrawalConfirmed(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    Map<String, String> commandMap
+  ) {
+    if (queueEntity.getUserId() == null) {
+      return;
+    }
+
+    transactionsService.updateTransactionBlockHash(
+      queueEntity.getTransactionId(),
+      queueEntity.getBlockHash()
+    );
+
+    String decimalValue = currenciesService.getCurrencyDecimalValue(
+      queueEntity.getRaw(),
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
+
+    String header =
+      "<@" +
+      queueEntity.getUserId() +
+      ">'s withdrawal " +
+      CONFIRMED_NOTE +
+      "\n";
+
+    String commandNote =
+      "\n-# Use </transactions:" +
+      commandMap.get("transactions") +
+      "> to view your transaction history.\n";
+
+    String body =
+      "### 💸 __Currency Transfers__\n> **" +
+      decimalValue +
+      " " +
+      currencyEntity.getTicker() +
+      "** (≈$" +
+      currenciesService.getCurrencyDollarValue(
+        decimalValue,
+        currencyEntity.getValue()
+      ) +
+      ") " +
+      currencyEntity.getEmoji() +
+      "\n-# The network fee was deducted from the amount sent." +
+      "\n### 🔗 __Transaction__\n> `" +
+      queueEntity.getBlockHash() +
+      "`\n### 📌 __Withdrawal Address__\n> `" +
+      queueEntity.getTargetAddress() +
+      "`";
+
+    String title = "🧾 Withdrawal Confirmed";
+    String url = explorerTxUrl(currencyEntity, queueEntity.getBlockHash());
+
+    messagesService.createMessage(
+      new MessageDto(
+        null,
+        System.getenv("HOME_SERVER_ID"),
+        System.getenv("WITHDRAWAL_LOGGING_CHANNEL_ID"),
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + body,
+        new Date(),
+        url,
+        null,
+        null
+      )
+    );
+
+    messagesService.createMessage(
+      new MessageDto(
+        queueEntity.getUserId(),
+        null,
+        null,
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + commandNote + body,
+        new Date(),
+        url,
+        null,
+        null
+      )
+    );
+  }
+
+  @Override
+  public String refundFailedWithdrawal(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    String reason,
+    Map<String, String> commandMap
+  ) {
+    String userId = queueEntity.getUserId();
+    if (userId == null) {
+      return null;
+    }
+
+    TransferResponseDto transferResponseDto = new TransferResponseDto();
+    coreServices.commandsService.setCommands(
+      Constants.COMMAND_NAME_RECEIVE,
+      userId,
+      transferResponseDto::setCommands
+    );
+
+    List<WalletDto> wallets = new ArrayList<>();
+    wallets.add(
+      new WalletDto(currencyEntity.getTicker(), queueEntity.getRaw(), true)
+    );
+    transferResponseDto.setPrimaryTransfer(
+      new TransferDto(wallets, new ArrayList<>())
+    );
+
+    // Mint back from the system account, the same path a deposit takes. The
+    // balance was burned when the withdrawal was queued, so this restores it.
+    TransferResponseDto transfer = transferExecutorService.executeTransfer(
+      Constants.COMMAND_NAME_RECEIVE,
+      null,
+      null,
+      "0",
+      null,
+      Collections.singletonList(userId),
+      null,
+      transferResponseDto
+    );
+
+    if (transfer == null || transfer.getTransactionId() == null) {
+      fileLogger.error(
+        "Refund transfer FAILED for user " +
+        userId +
+        " on " +
+        currencyEntity.getTicker() +
+        " amount " +
+        queueEntity.getRaw() +
+        "; balance remains debited and needs manual correction."
+      );
+      return null;
+    }
+
+    String decimalValue = currenciesService.getCurrencyDecimalValue(
+      queueEntity.getRaw(),
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
+
+    String title = "💀 Withdrawal Failed";
+    String footer = "Nanobot Transaction ID " + transfer.getTransactionId();
+
+    String header =
+      "<@" + userId + ">'s withdrawal *could not be completed*.\n" + reason + "\n";
+
+    String commandNote =
+      "\n-# Use </transactions:" +
+      commandMap.get("transactions") +
+      "> to view your transaction history." +
+      "\n-# Use </wallet:" +
+      commandMap.get("wallet") +
+      "> to view your *updated* currency balances.\n";
+
+    // Wallet Credits only. There is no block hash because nothing was
+    // broadcast, and no deposit address because this is a refund rather than an
+    // incoming deposit.
+    String body =
+      "### 💼 __Wallet Credits__\n> **" +
+      decimalValue +
+      " " +
+      currencyEntity.getTicker() +
+      "** (≈$" +
+      currenciesService.getCurrencyDollarValue(
+        decimalValue,
+        currencyEntity.getValue()
+      ) +
+      ") " +
+      currencyEntity.getEmoji();
+
+    messagesService.createMessage(
+      new MessageDto(
+        null,
+        System.getenv("HOME_SERVER_ID"),
+        System.getenv("WITHDRAWAL_LOGGING_CHANNEL_ID"),
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + body,
+        new Date(),
+        null,
+        null,
+        footer
+      )
+    );
+
+    messagesService.createMessage(
+      new MessageDto(
+        userId,
+        null,
+        null,
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + commandNote + body,
+        new Date(),
+        null,
+        null,
+        footer
+      )
+    );
+
+    fileLogger.warn(
+      "Refunded failed " +
+      currencyEntity.getTicker() +
+      " withdrawal of " +
+      queueEntity.getRaw() +
+      " to user " +
+      userId
+    );
+
+    return transfer.getTransactionId();
+  }
+
+  @Override
+  public String explorerTxUrl(CurrencyEntity currencyEntity, String txid) {
+    return applyTemplate(currencyEntity.getExplorerTxUrl(), txid);
+  }
+
+  @Override
+  public String explorerAccountUrl(
+    CurrencyEntity currencyEntity,
+    String address
+  ) {
+    return applyTemplate(currencyEntity.getExplorerAccountUrl(), address);
+  }
+
+  private String applyTemplate(String template, String value) {
+    if (template == null || template.isBlank() || value == null) {
+      return null;
+    }
+    return template.replace(URL_PLACEHOLDER, value);
+  }
+}

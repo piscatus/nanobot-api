@@ -361,26 +361,27 @@ public class TransferServicesImpl implements TransferServices {
       );
 
       if (transfer.getCompletedPrimaryTransfers() != null) {
-        DropEntity dropEntity = dropsService
-          .createDrop(
-            new DropDto(
-              requestDto.getChannelId(),
-              requestDto.getDuration() == 0
-                ? Constants.defaultDropDuration
-                : requestDto.getDuration(),
-              calendar.getTime(),
-              requestDto.getGuildId(),
-              requestDto.getInput(),
-              maximumEntriesForDrop,
-              null, // transfer message not yet calculated
-              requestDto.getRandom(),
-              requestDto.getRoleId(),
-              new Date(),
-              transferResponseDto.getPrimaryTransfer(),
-              requestDto.getUserId()
-            )
-          )
-          .get();
+        DropDto newDrop = new DropDto(
+          requestDto.getChannelId(),
+          requestDto.getDuration() == 0
+            ? Constants.defaultDropDuration
+            : requestDto.getDuration(),
+          calendar.getTime(),
+          requestDto.getGuildId(),
+          requestDto.getInput(),
+          maximumEntriesForDrop,
+          null, // transfer message not yet calculated
+          requestDto.getRandom(),
+          requestDto.getRoleId(),
+          new Date(),
+          transferResponseDto.getPrimaryTransfer(),
+          requestDto.getUserId()
+        );
+        // Persisted so the closing embed, which is built long after the command
+        // returns, can name the creator without relying on Discord's cache.
+        newDrop.setUsername(requestDto.getUsername());
+
+        DropEntity dropEntity = dropsService.createDrop(newDrop).get();
 
         transfer.getDrop().setId(dropEntity.getId());
 

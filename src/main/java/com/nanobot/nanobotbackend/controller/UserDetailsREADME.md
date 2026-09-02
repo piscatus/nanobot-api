@@ -30,6 +30,11 @@ BODY:
     "subordinateUserId": "9964246"
 }
 
+NOTE: "seed" derives Nano-family deposit addresses only. Monero and Bitcoin
+allocate an address from a hot wallet instead and store the mapping in
+depositAddresses, so a user with no seed can still hold and receive those. See
+CHAINS.md.
+
 ---
 
 ENDPOINT:
