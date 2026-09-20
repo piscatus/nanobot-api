@@ -25,6 +25,7 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -81,6 +82,26 @@ public class DropServiceImpl implements DropService {
     List<PickupDto> pickeruppers,
     String eachSummary
   ) {
+    return formatPickeruppers(
+      dropCommandId,
+      drop,
+      pickeruppers,
+      eachSummary,
+      Constants.COMMAND_NAME_DROP
+    );
+  }
+
+  /**
+   * @param commandName which slash command created the drop, so the closing
+   *   embed links the right one ("drop" or "triviadrop").
+   */
+  public String formatPickeruppers(
+    String dropCommandId,
+    DropEntity drop,
+    List<PickupDto> pickeruppers,
+    String eachSummary,
+    String commandName
+  ) {
     int size = pickeruppers.size();
     // Mention plus plain username: an uncached member renders as a raw id, so
     // the mention alone leaves other readers unable to tell who dropped.
@@ -94,7 +115,9 @@ public class DropServiceImpl implements DropService {
 
     String response =
       creator +
-      " used </drop:" +
+      " used </" +
+      commandName +
+      ":" +
       dropCommandId +
       "> to transfer **" +
       drop.getInput() +
@@ -224,6 +247,50 @@ public class DropServiceImpl implements DropService {
     return sorted;
   }
 
+  /** Pickups on a trivia drop that pressed the right button. */
+  static List<PickupEntity> correctPickups(
+    DropEntity drop,
+    List<PickupEntity> pickups
+  ) {
+    if (!drop.hasTrivia()) {
+      return new ArrayList<>(pickups);
+    }
+    return pickups
+      .stream()
+      .filter(p -> drop.getTrivia().isCorrect(p.getAnswerIndex()))
+      .collect(Collectors.toList());
+  }
+
+  /**
+   * Who a trivia drop pays: the correct answers in the order they arrived,
+   * capped at maximumEntries. Speed breaks the tie, not chance, and the cap
+   * re-applies here so two answers landing in the same instant cannot pay one
+   * winner more than the drop allows.
+   */
+  static List<PickupEntity> selectTriviaWinners(
+    DropEntity drop,
+    List<PickupEntity> pickups
+  ) {
+    List<PickupEntity> correct = correctPickups(drop, pickups);
+    correct.sort(
+      Comparator.comparing(
+        PickupEntity::getTimestamp,
+        Comparator.nullsLast(Comparator.naturalOrder())
+      )
+    );
+    BigInteger maximum = drop.getMaximumEntries() == null
+      ? null
+      : new BigInteger(drop.getMaximumEntries());
+    if (
+      maximum != null &&
+      maximum.signum() > 0 &&
+      maximum.compareTo(BigInteger.valueOf(correct.size())) < 0
+    ) {
+      return new ArrayList<>(correct.subList(0, maximum.intValue()));
+    }
+    return correct;
+  }
+
   @Override
   public BaseResponseDto dropUpdate(RequestDto requestDto) {
     String dropId = requestDto.getId();
@@ -257,11 +324,18 @@ public class DropServiceImpl implements DropService {
     );
     String dropId = drop.getId();
     String userId = drop.getUserId();
+    boolean trivia = drop.hasTrivia();
+    String commandName = trivia
+      ? Constants.COMMAND_NAME_TRIVIADROP
+      : Constants.COMMAND_NAME_DROP;
+    String endedTitle = trivia
+      ? "🏁 The trivia drop has ended!"
+      : "🏁 The drop has ended!";
     Optional<DropEntity> deletedDrop = dropsService.deleteDrop(dropId);
     if (deletedDrop.isPresent()) {
       TransferResponseDto transferResponseDto = new TransferResponseDto();
       coreServices.commandsService.setCommands(
-        Constants.COMMAND_NAME_DROP,
+        commandName,
         System.getenv("OWNER_USER_ID"),
         transferResponseDto::setCommands
       );
@@ -287,7 +361,7 @@ public class DropServiceImpl implements DropService {
           "Drop Duration:",
           valueField,
           "**" +
-          TimeUtil.formatTimeRemaining(drop.getDuration().longValue() * 60000) +
+          TimeUtil.formatTimeRemaining(dropDurationMillis(drop)) +
           "**",
           inlineField,
           true
@@ -312,7 +386,7 @@ public class DropServiceImpl implements DropService {
         criteriaList.add(
           Map.of(
             nameField,
-            "Maximum Entries:",
+            trivia ? "Maximum Winners:" : "Maximum Entries:",
             valueField,
             "**" + maxEntries + "**",
             inlineField,
@@ -351,14 +425,66 @@ public class DropServiceImpl implements DropService {
 
       String grayColor = "#757575";
 
-      MessageDto editMessage = null;
-      if (pickups.isEmpty()) {
+      // A trivia drop reveals its question and answer once it is over, and
+      // pays only the correct answers; a plain drop considers every joiner.
+      List<PickupEntity> winners = trivia
+        ? selectTriviaWinners(drop, pickups)
+        : pickups;
+      if (trivia) {
         criteriaList.add(
-          Map.of("name", "Users Joined:", "value", "**0**", "inline", true)
+          Map.of(
+            nameField,
+            "Question:",
+            valueField,
+            drop.getTrivia().getQuestion(),
+            inlineField,
+            false
+          )
         );
+        criteriaList.add(
+          Map.of(
+            nameField,
+            "Correct Answer:",
+            valueField,
+            "**" +
+            Optional
+              .ofNullable(drop.getTrivia().getCorrectAnswer())
+              .orElse("?") +
+            "**",
+            inlineField,
+            false
+          )
+        );
+        criteriaList.add(
+          Map.of(
+            nameField,
+            "Answered:",
+            valueField,
+            "**" +
+            pickups.size() +
+            "** (**" +
+            correctPickups(drop, pickups).size() +
+            "** correct)",
+            inlineField,
+            true
+          )
+        );
+      }
+
+      MessageDto editMessage = null;
+      if (winners.isEmpty()) {
+        if (!trivia) {
+          criteriaList.add(
+            Map.of("name", "Users Joined:", "value", "**0**", "inline", true)
+          );
+        }
+        // Wrong answers on a trivia drop still have to be cleared away.
+        for (PickupEntity pickup : pickups) {
+          pickupsService.deletePickup(pickup.getId());
+        }
 
         transferExecutorService.executeTransfer(
-          Constants.COMMAND_NAME_DROP,
+          commandName,
           drop.getGuildId(),
           drop.getChannelId(),
           "0",
@@ -368,34 +494,62 @@ public class DropServiceImpl implements DropService {
           transferResponseDto
         );
 
+        String content = formatPickeruppers(
+          commandMap.get(commandName),
+          drop,
+          new ArrayList<>(),
+          null,
+          commandName
+        );
+        if (trivia) {
+          content +=
+            "\n-# Nobody answered correctly, so the drop was returned.";
+        }
+
         editMessage = new MessageDto(
           null,
           drop.getGuildId(),
           drop.getChannelId(),
           drop.getMessageId(),
-          "🏁 The drop has ended!",
+          endedTitle,
           grayColor,
-          formatPickeruppers(commandMap.get("drop"), drop, new ArrayList<>()),
+          content,
           new Date(),
           null,
           criteriaList,
           null
         );
       } else {
-        criteriaList.add(
-          Map.of(
-            nameField,
-            "Users Joined:",
-            valueField,
-            "**" + pickups.size() + "**",
-            inlineField,
-            true
-          )
-        );
+        if (!trivia) {
+          criteriaList.add(
+            Map.of(
+              nameField,
+              "Users Joined:",
+              valueField,
+              "**" + pickups.size() + "**",
+              inlineField,
+              true
+            )
+          );
+        }
         int numberOfWinners = drop.getNumberWinners();
         List<PickupDto> pickeruppers = new ArrayList<>();
 
-        if (numberOfWinners == 0) {
+        if (trivia) {
+          // Every answer is cleared; only the selected winners are paid.
+          Set<String> winnerIds = winners
+            .stream()
+            .map(PickupEntity::getId)
+            .collect(Collectors.toSet());
+          for (PickupEntity pickup : pickups) {
+            Optional<PickupEntity> deletedPickup = pickupsService.deletePickup(
+              pickup.getId()
+            );
+            if (deletedPickup.isPresent() && winnerIds.contains(pickup.getId())) {
+              pickeruppers.add(new PickupDto(pickup));
+            }
+          }
+        } else if (numberOfWinners == 0) {
           for (PickupEntity pickup : pickups) {
             String pickupId = pickup.getId();
             Optional<PickupEntity> deletedPickup = pickupsService.deletePickup(
@@ -426,7 +580,7 @@ public class DropServiceImpl implements DropService {
         transferResponseDto.setSecondaryTransfer(drop.getTransfer());
 
         TransferResponseDto completed = transferExecutorService.executeTransfer(
-          Constants.COMMAND_NAME_DROP,
+          commandName,
           drop.getGuildId(),
           drop.getChannelId(),
           "0",
@@ -444,13 +598,14 @@ public class DropServiceImpl implements DropService {
           drop.getGuildId(),
           drop.getChannelId(),
           drop.getMessageId(),
-          "🏁 The drop has ended!",
+          endedTitle,
           grayColor,
           formatPickeruppers(
-            commandMap.get("drop"),
+            commandMap.get(commandName),
             drop,
             sortPickupsByJoinTimeForDisplay(pickeruppers),
-            formatEachSummary(completed)
+            formatEachSummary(completed),
+            commandName
           ),
           new Date(),
           null,
@@ -478,7 +633,11 @@ public class DropServiceImpl implements DropService {
       List<PickupEntity> pickups = drop.getMessageId() != null
         ? pickupsService.getPickups(drop.getMessageId(), null)
         : Collections.emptyList();
-      if (BigInteger.valueOf(pickups.size()).compareTo(bigMaximumEntries) < 0) {
+      // On a trivia drop only correct answers count towards the cap.
+      int counted = drop.hasTrivia()
+        ? correctPickups(drop, pickups).size()
+        : pickups.size();
+      if (BigInteger.valueOf(counted).compareTo(bigMaximumEntries) < 0) {
         continue;
       }
       dropCleanup(drop, pickups);
@@ -501,5 +660,11 @@ public class DropServiceImpl implements DropService {
 
       dropCleanup(drop, pickups);
     }
+  }
+
+  private static long dropDurationMillis(DropEntity drop) {
+    long minutes = drop.getDuration() == null ? 0L : drop.getDuration();
+    long seconds = drop.getSeconds() == null ? 0L : drop.getSeconds();
+    return minutes * 60000L + seconds * 1000L;
   }
 }

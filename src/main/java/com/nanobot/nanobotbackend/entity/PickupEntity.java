@@ -16,6 +16,9 @@ public class PickupEntity extends BaseEntity {
 
   private Date timestamp;
 
+  /** Which answer button was pressed on a trivia drop; null on a plain drop. */
+  private Integer answerIndex;
+
   public PickupEntity() {
     super();
   }
@@ -25,6 +28,15 @@ public class PickupEntity extends BaseEntity {
     this.dropId = pickup.getDropId();
     this.userId = pickup.getUserId();
     this.timestamp = new Date();
+    this.answerIndex = pickup.getAnswerIndex();
+  }
+
+  public Integer getAnswerIndex() {
+    return answerIndex;
+  }
+
+  public void setAnswerIndex(Integer answerIndex) {
+    this.answerIndex = answerIndex;
   }
 
   public String getDropId() {

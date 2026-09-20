@@ -70,4 +70,14 @@ public class TransferController {
       HttpStatus.OK
     );
   }
+
+  @PutMapping("/triviadrop")
+  public ResponseEntity<TransferResponseDto> triviadrop(
+    @RequestBody RequestDto requestData
+  ) {
+    return new ResponseEntity<>(
+      transferServices.triviadrop(requestData),
+      HttpStatus.OK
+    );
+  }
 }

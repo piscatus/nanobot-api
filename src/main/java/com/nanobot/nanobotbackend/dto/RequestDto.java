@@ -6,13 +6,34 @@ public class RequestDto extends BaseDto {
 
   private String address;
 
+  /**
+   * Which answer button a user pressed on a trivia drop (0-based). Sent with a
+   * pickup request; absent on plain drops. Setter-bound like {@code ticker}.
+   */
+  private Integer answerIndex;
+
+  /**
+   * Trivia category requested by a /triviadrop, or null for any. Setter-bound
+   * so existing constructor call sites keep compiling.
+   */
+  private String category;
+
   private String channelId;
 
   private boolean confirmation;
 
+  /** Trivia difficulty requested by a /triviadrop (easy, medium, hard) or null for any. */
+  private String difficulty;
+
   private String dropId;
 
   private Integer duration;
+
+  /**
+   * Leftover seconds on a /triviadrop (0–59). Null means none were asked for.
+   * The 10-second floor applies only when duration minutes is not set.
+   */
+  private Integer seconds;
 
   private boolean global;
 
@@ -95,6 +116,22 @@ public class RequestDto extends BaseDto {
     this.address = address;
   }
 
+  public Integer getAnswerIndex() {
+    return answerIndex;
+  }
+
+  public void setAnswerIndex(Integer answerIndex) {
+    this.answerIndex = answerIndex;
+  }
+
+  public String getCategory() {
+    return category;
+  }
+
+  public void setCategory(String category) {
+    this.category = category;
+  }
+
   public String getChannelId() {
     return channelId;
   }
@@ -111,6 +148,14 @@ public class RequestDto extends BaseDto {
     this.confirmation = confirmation;
   }
 
+  public String getDifficulty() {
+    return difficulty;
+  }
+
+  public void setDifficulty(String difficulty) {
+    this.difficulty = difficulty;
+  }
+
   public String getDropId() {
     return dropId;
   }
@@ -125,6 +170,14 @@ public class RequestDto extends BaseDto {
 
   public void setDuration(Integer duration) {
     this.duration = duration;
+  }
+
+  public Integer getSeconds() {
+    return seconds;
+  }
+
+  public void setSeconds(Integer seconds) {
+    this.seconds = seconds;
   }
 
   public boolean getGlobal() {

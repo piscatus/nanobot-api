@@ -14,10 +14,12 @@ import com.nanobot.nanobotbackend.dto.MessageDto;
 import com.nanobot.nanobotbackend.dto.PickupDto;
 import com.nanobot.nanobotbackend.dto.TransferDto;
 import com.nanobot.nanobotbackend.dto.RequestDto;
+import com.nanobot.nanobotbackend.dto.TriviaQuestionDto;
 import com.nanobot.nanobotbackend.entity.DropEntity;
 import com.nanobot.nanobotbackend.entity.PickupEntity;
 import com.nanobot.nanobotbackend.util.Constants;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
@@ -366,6 +368,59 @@ class DropServiceImplTest {
     verify(messagesService).createMessage(any(MessageDto.class));
   }
 
+  @Test
+  void selectTriviaWinnersOrdersByTimestampCutsToMaximumEntriesAndIgnoresWrongAnswers() {
+    DropEntity drop = triviaDropWithCorrectIndex(2);
+    drop.setMaximumEntries("2");
+
+    PickupEntity wrong = triviaPickup("wrong", 0, new Date(1_000));
+    PickupEntity late = triviaPickup("late", 2, new Date(4_000));
+    PickupEntity early = triviaPickup("early", 2, new Date(2_000));
+    PickupEntity middle = triviaPickup("middle", 2, new Date(3_000));
+
+    List<PickupEntity> winners = DropServiceImpl.selectTriviaWinners(
+      drop,
+      List.of(wrong, late, early, middle)
+    );
+
+    assertEquals(2, winners.size());
+    assertEquals("early", winners.get(0).getUserId());
+    assertEquals("middle", winners.get(1).getUserId());
+  }
+
+  @Test
+  void selectTriviaWinnersReturnsAllWhenMaximumEntriesExceedsCorrectCount() {
+    DropEntity drop = triviaDropWithCorrectIndex(2);
+    drop.setMaximumEntries("10");
+
+    PickupEntity first = triviaPickup("a", 2, new Date(1_000));
+    PickupEntity second = triviaPickup("b", 2, new Date(2_000));
+    PickupEntity wrong = triviaPickup("c", 0, new Date(1_500));
+
+    List<PickupEntity> winners = DropServiceImpl.selectTriviaWinners(
+      drop,
+      List.of(first, second, wrong)
+    );
+
+    assertEquals(2, winners.size());
+    assertEquals("a", winners.get(0).getUserId());
+    assertEquals("b", winners.get(1).getUserId());
+  }
+
+  @Test
+  void correctPickupsReturnsEverythingForANonTriviaDrop() {
+    DropEntity drop = new DropEntity();
+    PickupEntity first = triviaPickup("a", 0, new Date(1_000));
+    PickupEntity second = triviaPickup("b", 2, new Date(2_000));
+    List<PickupEntity> pickups = List.of(first, second);
+
+    List<PickupEntity> result = DropServiceImpl.correctPickups(drop, pickups);
+
+    assertEquals(2, result.size());
+    assertEquals("a", result.get(0).getUserId());
+    assertEquals("b", result.get(1).getUserId());
+  }
+
   private DropEntity createMinimalDrop() {
     DropEntity drop = new DropEntity();
     drop.setId("drop-1");
@@ -401,5 +456,26 @@ class DropServiceImplTest {
     );
     dto.setId(id);
     return dto;
+  }
+
+  private DropEntity triviaDropWithCorrectIndex(int correctIndex) {
+    DropEntity drop = new DropEntity();
+    TriviaQuestionDto trivia = new TriviaQuestionDto();
+    trivia.setAnswers(List.of("A", "B", "C", "D"));
+    trivia.setCorrectIndex(correctIndex);
+    drop.setTrivia(trivia);
+    return drop;
+  }
+
+  private PickupEntity triviaPickup(
+    String userId,
+    int answerIndex,
+    Date timestamp
+  ) {
+    PickupEntity pickup = new PickupEntity();
+    pickup.setUserId(userId);
+    pickup.setAnswerIndex(answerIndex);
+    pickup.setTimestamp(timestamp);
+    return pickup;
   }
 }

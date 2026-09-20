@@ -14,4 +14,6 @@ public interface TransferServices {
   TransferResponseDto rain(RequestDto requestDto);
 
   TransferResponseDto sell(RequestDto requestDto);
+
+  TransferResponseDto triviadrop(RequestDto requestDto);
 }
