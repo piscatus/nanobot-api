@@ -88,6 +88,32 @@ Bitcoin additionally sums multiple outputs paying the same address in one
 transaction. Deposit records are keyed per address, so crediting them
 individually would book the first and silently drop the rest.
 
+### Discovery Notices
+
+Bitcoin and Monero tell the user about a deposit before it can be credited, so a
+transfer that takes an hour to settle does not look lost in the meantime:
+
+- Bitcoin runs its `listsinceblock` window every ten seconds even when no block
+  has arrived, and anything in the `receive` category with fewer than the
+  required confirmations (and not fewer than zero, which means conflicted) is a
+  discovery.
+- Monero asks the wallet for its transaction pool every ten seconds, and also
+  treats an `in` transfer that is mined but not yet ten deep as a discovery when
+  the block-gated scan sees one.
+- Nano has no such phase. A deposit is only ever seen once it is confirmed, so
+  discovery and crediting are the same moment and there is nothing to announce
+  early.
+
+A discovery is announced exactly once. `depositNotices` is unique on
+`(ticker, txid, addressIndex)` and the row is inserted before the message is
+written, the same insert-or-skip pattern as crediting, so re-seeing the same
+transaction on every scan costs nothing. It is a separate collection from
+`depositRecords` on purpose: a row there means money moved, and the credit paths
+must never have to ask which kind of row they are looking at. A deposit that
+already has a record is never announced as discovered, since a "discovered"
+after a "confirmed" would read as a second deposit. Notice rows expire after a
+week.
+
 ## Exactly-Once Crediting
 
 - `depositRecords` is unique on `(ticker, txid, addressIndex)`.
@@ -103,11 +129,26 @@ individually would book the first and silently drop the rest.
 1. `/send` validates the address and the minimum, then debits the user
    immediately and creates a `SEND` queue entry.
 2. The adapter picks the entry up, builds and broadcasts the transaction, and
-   records the resulting hash.
-3. Once confirmed, the queue entry is deleted and the user is notified.
+   records the resulting hash. The user is told the withdrawal has been *sent*,
+   with the hash and how many confirmations it needs.
+3. Once confirmed, the queue entry is deleted and the user is told it has been
+   *confirmed*.
 
 The balance is gone from the moment the entry is created. Everything below
 exists because of that.
+
+The "sent" notice goes out on every protocol, Nano included even though its
+confirmation usually follows within a second or two. The pair of messages shows
+how fast the network is, and when the node is slow to see the confirmation the
+user still has proof that their `/send` went out. It is only written on a fresh
+broadcast: the recovery paths cannot tell whether it was announced before the
+crash, and a second "sent" would look like a second withdrawal.
+
+A Monero withdrawal to one of the bot's own deposit addresses confirms both a
+withdrawal and a deposit at once. The deposit is credited on the ledger before
+the queue entry is dropped, since that order is what keeps a crash in between
+recoverable, but its notice is held back until after the withdrawal notice so
+the two messages read in the order things happened.
 
 ### Broadcast Safety
 
@@ -189,6 +230,7 @@ is in. Collapsing the last two is how a user gets paid twice.
 | `queues` | in-flight sends, receives and representative updates |
 | `depositAddresses` | address to user mapping for hot-wallet protocols |
 | `depositRecords` | permanent record of credited deposits; the double-credit guard |
+| `depositNotices` | deposits already announced as discovered; expires after a week |
 | `currencies` | per-currency configuration and chain cursor state |
 
 ## Currency Configuration

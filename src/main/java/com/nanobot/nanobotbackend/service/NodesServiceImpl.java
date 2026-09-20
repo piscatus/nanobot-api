@@ -635,6 +635,25 @@ public class NodesServiceImpl
     fileLogger.info(
       "Successfully processed send transaction: " + queueEntity.getBlockHash()
     );
+
+    // Announced even though confirmation usually follows within a second or
+    // two: the pair of messages shows how fast the network is, and when the
+    // node is slow to see the confirmation the user still has proof that their
+    // /send went out. Only on a fresh publish; the recovery path above cannot
+    // tell whether this was already announced before the crash. Bot-owned
+    // sends have nobody to tell, matching confirmSend.
+    if (
+      queueEntity.getUserId() != null &&
+      !queueEntity.getUserId().equals(botUserId)
+    ) {
+      // Nano is quorum confirmed, so a single confirmation is final.
+      chainLedgerService.notifyWithdrawalSent(
+        currencyEntity,
+        queueEntity,
+        1,
+        commandMap
+      );
+    }
   }
 
   /**

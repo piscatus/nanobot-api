@@ -472,6 +472,323 @@ class FishServicesImplTest {
     );
   }
 
+  @Test
+  void fishUsesTheSavedDefaultWhenNoTickerIsRequested() {
+    RequestDto request = minimalRequest();
+    setupFishableGuild(request);
+    savedDefault(request, "BAN");
+
+    // The draw is random, so repeat enough that a leaking XNO creature would show
+    for (int attempt = 0; attempt < 25; attempt++) {
+      TransferResponseDto result = fishServices.fish(request);
+
+      assertNull(result.getErrorMessage());
+      assertEquals("BAN", caughtTicker(result));
+      assertEquals("BAN", result.getDefaultTicker());
+      assertFalse(
+        result.getDefaultTickerChanged(),
+        "Inheriting a default should not rewrite it"
+      );
+    }
+    verify(anglersService, never()).setAnglerTicker(any(), any(), any());
+  }
+
+  @Test
+  void fishWithTickerSavesItAsTheDefault() {
+    RequestDto request = minimalRequest();
+    request.setTicker("BAN");
+    setupFishableGuild(request);
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNull(result.getErrorMessage());
+    assertEquals("BAN", result.getDefaultTicker());
+    assertTrue(result.getDefaultTickerChanged());
+    verify(anglersService).setAnglerTicker(
+      request.getGuildId(),
+      request.getUserId(),
+      "BAN"
+    );
+  }
+
+  @Test
+  void fishStampsTheCooldownOnTheAnglerItJustWrote() {
+    RequestDto request = minimalRequest();
+    request.setTicker("BAN");
+    setupFishableGuild(request);
+
+    AnglerEntity written = new AnglerEntity(
+      request.getGuildId(),
+      request.getUserId(),
+      false,
+      null,
+      "BAN"
+    );
+    written.setId("angler-1");
+    when(
+      anglersService.setAnglerTicker(
+        request.getGuildId(),
+        request.getUserId(),
+        "BAN"
+      )
+    )
+      .thenReturn(written);
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNull(result.getErrorMessage());
+    // Reading the angler back would risk a majority-concern miss, and the
+    // resulting insert would violate the unique guildId/userId index
+    verify(anglersService).stampAnglerCatch(written);
+    verify(anglersService, never()).updateOrCreateAngler(any(), any());
+  }
+
+  @Test
+  void fishDoesNotRewriteADefaultThatIsAlreadySet() {
+    RequestDto request = minimalRequest();
+    request.setTicker("BAN");
+    setupFishableGuild(request);
+    savedDefault(request, "BAN");
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNull(result.getErrorMessage());
+    assertEquals("BAN", result.getDefaultTicker());
+    assertFalse(result.getDefaultTickerChanged());
+    verify(anglersService, never()).setAnglerTicker(any(), any(), any());
+  }
+
+  @Test
+  void fishWithAnyClearsTheSavedDefault() {
+    RequestDto request = minimalRequest();
+    request.setTicker(Constants.TICKER_ANY);
+    setupFishableGuild(request);
+    savedDefault(request, "BAN");
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNull(result.getErrorMessage());
+    assertNull(result.getDefaultTicker());
+    assertTrue(result.getDefaultTickerChanged());
+    verify(anglersService).setAnglerTicker(
+      request.getGuildId(),
+      request.getUserId(),
+      null
+    );
+  }
+
+  @Test
+  void fishNormalizesTheAnySentinel() {
+    RequestDto request = minimalRequest();
+    request.setTicker(" any ");
+    setupFishableGuild(request);
+    savedDefault(request, "BAN");
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNull(result.getErrorMessage());
+    verify(anglersService).setAnglerTicker(
+      request.getGuildId(),
+      request.getUserId(),
+      null
+    );
+  }
+
+  @Test
+  void fishWithAnyLeavesAUserWhoHasNoDefaultAlone() {
+    RequestDto request = minimalRequest();
+    request.setTicker(Constants.TICKER_ANY);
+    setupFishableGuild(request);
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNull(result.getErrorMessage());
+    assertFalse(result.getDefaultTickerChanged());
+    verify(anglersService, never()).setAnglerTicker(any(), any(), any());
+  }
+
+  @Test
+  void fishWithAnUnfishableSavedDefaultSaysItIsTheDefault() {
+    RequestDto request = minimalRequest();
+    setupFishableGuild(request);
+    savedDefault(request, "BAN");
+    drainBananoReserve(request);
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNotNull(result.getErrorMessage());
+    assertTrue(
+      result
+        .getErrorMessage()
+        .contains("default fishing currency for this server is :ban: Banano [BAN]"),
+      "Expected the default to be named: " + result.getErrorMessage()
+    );
+    assertTrue(
+      result.getErrorMessage().contains("Choose `Any`"),
+      "Expected advice to clear the default: " + result.getErrorMessage()
+    );
+    // A rejected trip is not a catch, so no cooldown is spent
+    verify(anglersService, never()).updateOrCreateAngler(any(), any());
+    verify(anglersService, never()).stampAnglerCatch(any());
+    verify(transferExecutorService, never()).executeTransfer(any(), any(), any(), any(), any(), any(), any(), any());
+  }
+
+  @Test
+  void fishDoesNotSaveADefaultThatCannotBeFished() {
+    RequestDto request = minimalRequest();
+    request.setTicker("BAN");
+    setupFishableGuild(request);
+    drainBananoReserve(request);
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNotNull(result.getErrorMessage());
+    // Saving it would reject every later trip made without an option
+    verify(anglersService, never()).setAnglerTicker(any(), any(), any());
+  }
+
+  @Test
+  void fishSavesTheDefaultWhileTheUserIsResting() {
+    RequestDto request = minimalRequest();
+    request.setTicker("BAN");
+    setupFishableGuild(request);
+    when(
+      anglersService.getAnglerByGuildIdAndUserId(
+        request.getGuildId(),
+        request.getUserId()
+      )
+    )
+      .thenReturn(
+        java.util.Optional.of(
+          new AnglerEntity(
+            request.getGuildId(),
+            request.getUserId(),
+            true,
+            new Date()
+          )
+        )
+      );
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNotNull(result.getErrorMessage());
+    assertTrue(
+      result.getErrorMessage().contains("must wait"),
+      "Expected wait: " + result.getErrorMessage()
+    );
+    assertTrue(
+      result
+        .getErrorMessage()
+        .contains(
+          "Your default fishing currency for this server is now :ban: Banano [BAN]."
+        ),
+      "Expected the default confirmation: " + result.getErrorMessage()
+    );
+    verify(anglersService).setAnglerTicker(
+      request.getGuildId(),
+      request.getUserId(),
+      "BAN"
+    );
+  }
+
+  @Test
+  void fishSavesTheDefaultWhenTheInventoryIsFull() {
+    RequestDto request = minimalRequest();
+    request.setTicker("BAN");
+    setupFishableGuild(request);
+
+    UserItemsEntity senderItems = new UserItemsEntity(request.getUserId());
+    senderItems.setItems(List.of(new ItemDto("SEAHORSE", 200, true)));
+    when(userItemsService.getUsersItems(request.getUserId()))
+      .thenReturn(List.of(senderItems));
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNotNull(result.getErrorMessage());
+    assertTrue(
+      result.getErrorMessage().contains("maximum capacity"),
+      "Expected capacity error: " + result.getErrorMessage()
+    );
+    assertTrue(
+      result.getErrorMessage().contains("is now :ban: Banano [BAN]."),
+      "Expected the default confirmation: " + result.getErrorMessage()
+    );
+    verify(anglersService).setAnglerTicker(
+      request.getGuildId(),
+      request.getUserId(),
+      "BAN"
+    );
+  }
+
+  @Test
+  void fishTreatsAnAnglerWithNoTimestampAsReadyToFish() {
+    RequestDto request = minimalRequest();
+    setupFishableGuild(request);
+
+    // What setAnglerTicker leaves behind for a user who set a default before
+    // ever catching anything: no timestamp means no cooldown to serve
+    when(
+      anglersService.getAnglerByGuildIdAndUserId(
+        request.getGuildId(),
+        request.getUserId()
+      )
+    )
+      .thenReturn(
+        java.util.Optional.of(
+          new AnglerEntity(
+            request.getGuildId(),
+            request.getUserId(),
+            false,
+            null,
+            "BAN"
+          )
+        )
+      );
+
+    TransferResponseDto result = fishServices.fish(request);
+
+    assertNull(result.getErrorMessage());
+    assertEquals("BAN", caughtTicker(result));
+    verify(anglersService).updateOrCreateAngler(
+      request.getGuildId(),
+      request.getUserId()
+    );
+  }
+
+  /** Points the user's saved default at a ticker for this guild. */
+  private void savedDefault(RequestDto request, String ticker) {
+    when(
+      anglersService.getAnglerByGuildIdAndUserId(
+        request.getGuildId(),
+        request.getUserId()
+      )
+    )
+      .thenReturn(
+        java.util.Optional.of(
+          new AnglerEntity(
+            request.getGuildId(),
+            request.getUserId(),
+            false,
+            null,
+            ticker
+          )
+        )
+      );
+  }
+
+  /** Drops the banano reserve below twice the priciest banano creature. */
+  private void drainBananoReserve(RequestDto request) {
+    GuildWalletsEntity guildWallet = new GuildWalletsEntity("guild1");
+    guildWallet.setWallets(
+      List.of(
+        new WalletDto("XNO", "1000000000000000000000000000000"),
+        new WalletDto("BAN", "1")
+      )
+    );
+    when(guildWalletsService.getGuildsWallets(request.getGuildId()))
+      .thenReturn(List.of(guildWallet));
+  }
+
   /**
    * A guild that can fish both currencies: reserves well above twice the
    * priciest creature, one creature stocked per ticker, no cooldown, no roles.

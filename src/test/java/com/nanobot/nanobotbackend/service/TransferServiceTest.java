@@ -10,6 +10,8 @@ import com.nanobot.nanobotbackend.dto.ItemDto;
 import com.nanobot.nanobotbackend.dto.TransferDto;
 import com.nanobot.nanobotbackend.dto.TransferResponseDto;
 import com.nanobot.nanobotbackend.dto.WalletDto;
+import com.nanobot.nanobotbackend.entity.CreatureEntity;
+import com.nanobot.nanobotbackend.entity.CurrencyEntity;
 import com.nanobot.nanobotbackend.entity.GuildWalletsEntity;
 import com.nanobot.nanobotbackend.entity.UserItemsEntity;
 import com.nanobot.nanobotbackend.entity.UserWalletsEntity;
@@ -531,6 +533,70 @@ public class TransferServiceTest {
       captured[0].contains("inventory"),
       "Expected inventory mention: " + captured[0]
     );
+  }
+
+  @Test
+  void allWalletSkipsDisabledCurrenciesInsteadOfFailing() {
+    CurrencyDto nano = new CurrencyDto("XNO", "Nano", true, "<:xno:>", "30");
+    CurrencyDto monero = new CurrencyDto("XMR", "Monero", false, "<:xmr:>", "12");
+    when(currenciesService.getCurrencies(isNull()))
+      .thenReturn(List.of(new CurrencyEntity(nano), new CurrencyEntity(monero)));
+    lenient().when(currenciesService.analyzeCurrencies(eq("Nano"))).thenReturn(nano);
+    lenient().when(currenciesService.analyzeCurrencies(eq("Monero"))).thenReturn(monero);
+    when(userWalletsService.getUsersWallets(eq("user1")))
+      .thenReturn(List.of(walletEntity("user1", "XNO", "500")));
+
+    final String[] captured = new String[1];
+    TransferDto result = transferService.processInputs(
+      "gift",
+      msg -> captured[0] = msg,
+      commandMap,
+      "GLOBAL",
+      "user1",
+      "all wallet",
+      false
+    );
+
+    assertNull(captured[0], "Disabled Monero should be skipped, got: " + captured[0]);
+    assertEquals(1, result.getWallets().size());
+    assertEquals("XNO", result.getWallets().get(0).getTicker());
+    assertEquals("500", result.getWallets().get(0).getRaw());
+    verify(currenciesService, never()).analyzeCurrencies(eq("Monero"));
+  }
+
+  @Test
+  void allCreaturesSkipsCreaturesOfDisabledCurrencies() {
+    CurrencyDto nano = new CurrencyDto("XNO", "Nano", true, "<:xno:>", "30");
+    CurrencyDto monero = new CurrencyDto("XMR", "Monero", false, "<:xmr:>", "12");
+    CreatureDto shrimp = new CreatureDto("Shrimp", "Shrimps", "<:shrimp:>", "XNO");
+    CreatureDto clam = new CreatureDto("Clam", "Clams", "<:clam:>", "XMR");
+    when(currenciesService.getCurrencies(isNull()))
+      .thenReturn(List.of(new CurrencyEntity(nano), new CurrencyEntity(monero)));
+    when(creaturesService.getCreatures())
+      .thenReturn(List.of(new CreatureEntity(shrimp), new CreatureEntity(clam)));
+    lenient().when(creaturesService.analyzeCreatures(eq("Shrimp"))).thenReturn(shrimp);
+    lenient().when(creaturesService.analyzeCreatures(eq("Clam"))).thenReturn(clam);
+    lenient().when(currenciesService.analyzeCurrencies(eq("XNO"))).thenReturn(nano);
+    lenient().when(currenciesService.analyzeCurrencies(eq("XMR"))).thenReturn(monero);
+    when(userItemsService.getUsersItems(eq("user1")))
+      .thenReturn(List.of(itemsEntity("user1", "SHRIMP", 3)));
+
+    final String[] captured = new String[1];
+    TransferDto result = transferService.processInputs(
+      "sell",
+      msg -> captured[0] = msg,
+      commandMap,
+      "GLOBAL",
+      "user1",
+      "all creatures",
+      false
+    );
+
+    assertNull(captured[0], "Disabled-currency creature should be skipped, got: " + captured[0]);
+    assertEquals(1, result.getItems().size());
+    assertEquals("SHRIMP", result.getItems().get(0).getName());
+    assertEquals(3, result.getItems().get(0).getQuantity());
+    verify(creaturesService, never()).analyzeCreatures(eq("Clam"));
   }
 
   @Test

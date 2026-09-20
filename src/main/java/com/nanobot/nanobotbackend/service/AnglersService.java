@@ -26,4 +26,8 @@ public interface AnglersService {
   Optional<AnglerEntity> deleteAngler(String id);
 
   AnglerEntity updateOrCreateAngler(String guildId, String userId);
+
+  AnglerEntity setAnglerTicker(String guildId, String userId, String ticker);
+
+  AnglerEntity stampAnglerCatch(AnglerEntity angler);
 }

@@ -27,6 +27,17 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
   private static final String URL_PLACEHOLDER = "{value}";
   private static final String CONFIRMED_NOTE =
     "has been *confirmed* on the network!";
+  private static final String DISCOVERED_NOTE =
+    "has been *discovered* on the network!";
+  private static final String SENT_NOTE = "has been *sent* to the network!";
+
+  /**
+   * Nano currencies predate the explorer templates on the currency document,
+   * so a missing template falls back to the address the Nano path has always
+   * linked to rather than rendering the notice without a link.
+   */
+  private static final String NANO_EXPLORER_BLOCK_URL =
+    "https://nanexplorer.com/{name}/blocks/{value}";
 
   private final CoreServices coreServices;
   private final CurrenciesService currenciesService;
@@ -58,6 +69,27 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
     String txid,
     String depositAddress,
     Map<String, String> commandMap
+  ) {
+    return creditDeposit(
+      currencyEntity,
+      userId,
+      raw,
+      txid,
+      depositAddress,
+      commandMap,
+      true
+    );
+  }
+
+  @Override
+  public String creditDeposit(
+    CurrencyEntity currencyEntity,
+    String userId,
+    String raw,
+    String txid,
+    String depositAddress,
+    Map<String, String> commandMap,
+    boolean notify
   ) {
     TransferResponseDto transferResponseDto = new TransferResponseDto();
     coreServices.commandsService.setCommands(
@@ -98,11 +130,36 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
       return null;
     }
 
+    if (notify) {
+      notifyDepositConfirmed(
+        currencyEntity,
+        userId,
+        raw,
+        txid,
+        depositAddress,
+        transfer.getTransactionId(),
+        commandMap
+      );
+    }
+
+    return transfer.getTransactionId();
+  }
+
+  @Override
+  public void notifyDepositConfirmed(
+    CurrencyEntity currencyEntity,
+    String userId,
+    String raw,
+    String txid,
+    String depositAddress,
+    String transactionId,
+    Map<String, String> commandMap
+  ) {
     String decimalValue = currenciesService.getCurrencyDecimalValue(
       raw,
       Integer.parseInt(currencyEntity.getPrecision())
     );
-    String footer = "Nanobot Transaction ID " + transfer.getTransactionId();
+    String footer = "Nanobot Transaction ID " + transactionId;
     String title = "🧾 Deposit Confirmed";
 
     String header =
@@ -167,8 +224,169 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
         footer
       )
     );
+  }
 
-    return transfer.getTransactionId();
+  @Override
+  public void notifyDepositDiscovered(
+    CurrencyEntity currencyEntity,
+    String userId,
+    String raw,
+    String txid,
+    String depositAddress,
+    long confirmations,
+    int required,
+    Map<String, String> commandMap
+  ) {
+    String decimalValue = currenciesService.getCurrencyDecimalValue(
+      raw,
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
+    String title = "👀 Deposit Discovered";
+
+    String header =
+      "<@" + userId + ">'s deposit " + DISCOVERED_NOTE + "\n";
+
+    // No /wallet pointer here: nothing has been credited yet, and sending
+    // someone to check a balance that has not changed would only confuse them.
+    String progressNote =
+      "\n-# Funds will be credited after **" +
+      pluralConfirmations(required) +
+      "** (currently " +
+      Math.max(0L, confirmations) +
+      "). You will receive another message once confirmed.\n";
+
+    String body =
+      "### 💼 __Pending Credit__\n> **" +
+      decimalValue +
+      " " +
+      currencyEntity.getTicker() +
+      "** (≈$" +
+      currenciesService.getCurrencyDollarValue(
+        decimalValue,
+        currencyEntity.getValue()
+      ) +
+      ") " +
+      currencyEntity.getEmoji() +
+      "\n### 🏠︎ __Deposit Address__\n> `" +
+      depositAddress +
+      "`\n### 🔗 __Transaction__\n> `" +
+      txid +
+      "`";
+
+    String url = explorerTxUrl(currencyEntity, txid);
+
+    messagesService.createMessage(
+      new MessageDto(
+        null,
+        System.getenv("HOME_SERVER_ID"),
+        System.getenv("DEPOSIT_LOGGING_CHANNEL_ID"),
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + body,
+        new Date(),
+        url,
+        null,
+        null
+      )
+    );
+
+    messagesService.createMessage(
+      new MessageDto(
+        userId,
+        null,
+        null,
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + progressNote + body,
+        new Date(),
+        url,
+        null,
+        null
+      )
+    );
+  }
+
+  @Override
+  public void notifyWithdrawalSent(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    int required,
+    Map<String, String> commandMap
+  ) {
+    if (queueEntity.getUserId() == null) {
+      return;
+    }
+
+    String decimalValue = currenciesService.getCurrencyDecimalValue(
+      queueEntity.getRaw(),
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
+
+    String header =
+      "<@" + queueEntity.getUserId() + ">'s withdrawal " + SENT_NOTE + "\n";
+
+    String progressNote =
+      "\n-# You will receive another message once it reaches **" +
+      pluralConfirmations(required) +
+      "**.\n";
+
+    String body =
+      "### 💸 __Currency Transfers__\n> **" +
+      decimalValue +
+      " " +
+      currencyEntity.getTicker() +
+      "** (≈$" +
+      currenciesService.getCurrencyDollarValue(
+        decimalValue,
+        currencyEntity.getValue()
+      ) +
+      ") " +
+      currencyEntity.getEmoji() +
+      feeNote(currencyEntity) +
+      "\n### 🔗 __" +
+      hashLabel(currencyEntity) +
+      "__\n> `" +
+      queueEntity.getBlockHash() +
+      "`\n### 📌 __Withdrawal Address__\n> `" +
+      queueEntity.getTargetAddress() +
+      "`";
+
+    String title = "📨 Withdrawal Sent";
+    String url = explorerTxUrl(currencyEntity, queueEntity.getBlockHash());
+
+    messagesService.createMessage(
+      new MessageDto(
+        null,
+        System.getenv("HOME_SERVER_ID"),
+        System.getenv("WITHDRAWAL_LOGGING_CHANNEL_ID"),
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + body,
+        new Date(),
+        url,
+        null,
+        null
+      )
+    );
+
+    messagesService.createMessage(
+      new MessageDto(
+        queueEntity.getUserId(),
+        null,
+        null,
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + progressNote + body,
+        new Date(),
+        url,
+        null,
+        null
+      )
+    );
   }
 
   @Override
@@ -392,7 +610,40 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
 
   @Override
   public String explorerTxUrl(CurrencyEntity currencyEntity, String txid) {
-    return applyTemplate(currencyEntity.getExplorerTxUrl(), txid);
+    String url = applyTemplate(currencyEntity.getExplorerTxUrl(), txid);
+    if (url == null && isNano(currencyEntity) && txid != null) {
+      return NANO_EXPLORER_BLOCK_URL
+        .replace("{name}", currencyEntity.getName().toLowerCase())
+        .replace(URL_PLACEHOLDER, txid);
+    }
+    return url;
+  }
+
+  /** "1 confirmation" or "6 confirmations", for the notices that quote one. */
+  static String pluralConfirmations(int required) {
+    return required + (required == 1 ? " confirmation" : " confirmations");
+  }
+
+  /**
+   * Nano is feeless, so the fee line the other chains carry would be a lie
+   * there.
+   */
+  private static String feeNote(CurrencyEntity currencyEntity) {
+    return isNano(currencyEntity)
+      ? ""
+      : "\n-# The network fee was deducted from the amount sent.";
+  }
+
+  /**
+   * Nano has no transactions, only blocks, and the rest of the Nano messages
+   * already say so; the notice keeps that wording so it reads as one voice.
+   */
+  private static String hashLabel(CurrencyEntity currencyEntity) {
+    return isNano(currencyEntity) ? "Block Hash" : "Transaction";
+  }
+
+  private static boolean isNano(CurrencyEntity currencyEntity) {
+    return Constants.PROTOCOL_NANO.equals(currencyEntity.getProtocol());
   }
 
   @Override

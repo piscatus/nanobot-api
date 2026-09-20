@@ -40,6 +40,12 @@ public class TransferResponseDto extends BaseResponseDto {
 
   private String input;
 
+  /** The user's default fishing currency after this request, or null for any. */
+  private String defaultTicker;
+
+  /** Whether this request changed that default, so the caller can confirm it. */
+  private boolean defaultTickerChanged;
+
   private TransferDto primaryTransfer;
 
   private TransferDto secondaryTransfer;
@@ -196,6 +202,22 @@ public class TransferResponseDto extends BaseResponseDto {
 
   public void setInput(String input) {
     this.input = input;
+  }
+
+  public String getDefaultTicker() {
+    return defaultTicker;
+  }
+
+  public void setDefaultTicker(String defaultTicker) {
+    this.defaultTicker = defaultTicker;
+  }
+
+  public boolean getDefaultTickerChanged() {
+    return defaultTickerChanged;
+  }
+
+  public void setDefaultTickerChanged(boolean defaultTickerChanged) {
+    this.defaultTickerChanged = defaultTickerChanged;
   }
 
   public TransferDto getPrimaryTransfer() {

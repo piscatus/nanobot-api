@@ -173,17 +173,29 @@ public class FishServicesImpl implements FishServices {
         return transferResponseDto;
       }
 
-      // Optional currency filter, so a user can target one ticker's creatures
-      String requestedTicker = normalizeTicker(requestDto.getTicker());
-      if (requestedTicker != null) {
+      // Read once, for both the saved currency default and the cooldown
+      Optional<AnglerEntity> angler =
+        anglersService.getAnglerByGuildIdAndUserId(
+          requestDto.getGuildId(),
+          requestDto.getUserId()
+        );
+
+      ResolvedTicker resolvedTicker = resolveTicker(
+        normalizeTicker(requestDto.getTicker()),
+        angler
+      );
+      String effectiveTicker = resolvedTicker.effectiveTicker();
+
+      if (effectiveTicker != null) {
         String tickerError = findRequestedTickerError(
-          requestedTicker,
+          effectiveTicker,
           maxCreatureValuesByTicker.keySet(),
           affordableTickers,
           requestDto.getUserId(),
           botUserId,
           commandMap,
-          transferResponseDto.getCurrencies()
+          transferResponseDto.getCurrencies(),
+          resolvedTicker.fromSavedDefault()
         );
         if (tickerError != null) {
           transferResponseDto.setErrorMessage(tickerError);
@@ -195,9 +207,32 @@ public class FishServicesImpl implements FishServices {
         .stream()
         .filter(creature -> affordableTickers.contains(creature.getTicker()))
         .filter(creature ->
-          requestedTicker == null || requestedTicker.equals(creature.getTicker())
+          effectiveTicker == null || effectiveTicker.equals(creature.getTicker())
         )
         .toList();
+
+      transferResponseDto.setDefaultTicker(effectiveTicker);
+      transferResponseDto.setDefaultTickerChanged(
+        resolvedTicker.changesDefault()
+      );
+
+      // Saved only once the currency is known to be fishable here, so a default
+      // can never be stored in a state that rejects every later catch. Saved
+      // before the remaining checks, so a full inventory or an unfinished
+      // cooldown still lets the user change what they fish for.
+      String defaultChangedNote = null;
+      AnglerEntity writtenAngler = null;
+      if (resolvedTicker.changesDefault()) {
+        writtenAngler = anglersService.setAnglerTicker(
+          requestDto.getGuildId(),
+          requestDto.getUserId(),
+          effectiveTicker
+        );
+        defaultChangedNote = formatDefaultChangedNote(
+          effectiveTicker,
+          transferResponseDto.getCurrencies()
+        );
+      }
 
       // Declare users item set
       Set<UserItemsEntity> currentUserItemQuantities = new HashSet<>();
@@ -217,7 +252,9 @@ public class FishServicesImpl implements FishServices {
           commandMap
         );
         if (capacityError != null) {
-          transferResponseDto.setErrorMessage(capacityError);
+          transferResponseDto.setErrorMessage(
+            appendNote(capacityError, defaultChangedNote)
+          );
           return transferResponseDto;
         }
       }
@@ -228,10 +265,13 @@ public class FishServicesImpl implements FishServices {
       String cooldownError = findCooldownError(
         requestDto,
         transferResponseDto,
-        commandMap
+        commandMap,
+        angler
       );
       if (cooldownError != null) {
-        transferResponseDto.setErrorMessage(cooldownError);
+        transferResponseDto.setErrorMessage(
+          appendNote(cooldownError, defaultChangedNote)
+        );
         return transferResponseDto;
       }
 
@@ -283,11 +323,17 @@ public class FishServicesImpl implements FishServices {
         return transfer;
       }
 
-      //set the fishing time
-      anglersService.updateOrCreateAngler(
-        requestDto.getGuildId(),
-        requestDto.getUserId()
-      );
+      // Set the fishing time. Reuse the angler just written for the currency
+      // default rather than reading it back: a majority-concern read can miss a
+      // document written moments ago, and the retry would insert a duplicate.
+      if (writtenAngler != null) {
+        anglersService.stampAnglerCatch(writtenAngler);
+      } else {
+        anglersService.updateOrCreateAngler(
+          requestDto.getGuildId(),
+          requestDto.getUserId()
+        );
+      }
 
       // Leaderboard increment
       leaderboardsService.incrementOrCreateLeaderboard(
@@ -437,9 +483,54 @@ public class FishServicesImpl implements FishServices {
   }
 
   /**
-   * Error when the user asked for a currency this server cannot fish right now,
-   * either because nothing has been stocked for it or because the reserve is
-   * too low, otherwise null.
+   * The currency a request will fish for, where a null ticker means any.
+   *
+   * @param fromSavedDefault whether the currency came from the user's saved
+   *   default rather than this request, which changes how a failure is explained
+   * @param changesDefault whether the saved default still has to be written
+   */
+  private record ResolvedTicker(
+    String effectiveTicker,
+    boolean fromSavedDefault,
+    boolean changesDefault
+  ) {}
+
+  /**
+   * Resolves what a request fishes for. Naming a currency also makes it the
+   * user's default for the guild, the "any" sentinel clears that default, and
+   * omitting the option inherits whatever was saved before.
+   */
+  private ResolvedTicker resolveTicker(
+    String requestedTicker,
+    Optional<AnglerEntity> angler
+  ) {
+    String savedTicker = normalizeTicker(
+      angler.map(AnglerEntity::getTicker).orElse(null)
+    );
+
+    if (requestedTicker == null) {
+      return new ResolvedTicker(savedTicker, savedTicker != null, false);
+    }
+
+    if (Constants.TICKER_ANY.equals(requestedTicker)) {
+      return new ResolvedTicker(null, false, savedTicker != null);
+    }
+
+    return new ResolvedTicker(
+      requestedTicker,
+      false,
+      !requestedTicker.equals(savedTicker)
+    );
+  }
+
+  /**
+   * Error when the currency a request resolved to cannot be fished here right
+   * now, either because nothing has been stocked for it or because the reserve
+   * is too low, otherwise null.
+   *
+   * <p>A saved default gets different advice from a one-off choice: the user did
+   * not name a currency on this request, so they have to be told they have a
+   * default at all before being told how to drop it.
    */
   private String findRequestedTickerError(
     String requestedTicker,
@@ -448,7 +539,8 @@ public class FishServicesImpl implements FishServices {
     String userId,
     String botUserId,
     Map<String, String> commandMap,
-    List<CurrencyDto> currencies
+    List<CurrencyDto> currencies,
+    boolean fromSavedDefault
   ) {
     if (affordableTickers.contains(requestedTicker)) {
       return null;
@@ -456,20 +548,31 @@ public class FishServicesImpl implements FishServices {
 
     String requested = formatCurrencyLabel(requestedTicker, currencies);
     String available = formatCurrencyLabels(affordableTickers, currencies);
-    String fishAgain =
-      "Run </" +
+    String fishCommand =
+      "</" +
       Constants.COMMAND_NAME_FISH +
       ":" +
       commandMap.get(Constants.COMMAND_NAME_FISH) +
-      "> without a currency to fish for anything!";
+      ">";
+
+    String opening = fromSavedDefault
+      ? "<@" +
+      userId +
+      "> cannot fish because their default fishing currency for this server is " +
+      requested +
+      ", and "
+      : "<@" + userId + "> cannot fish for " + requested + " creatures because ";
+
+    String fishAgain = fromSavedDefault
+      ? "Choose `Any` on " +
+      fishCommand +
+      " to clear your default and fish for anything!"
+      : "Run " + fishCommand + " without a currency to fish for anything!";
 
     if (!stockedTickers.contains(requestedTicker)) {
       return (
-        "<@" +
-        userId +
-        "> cannot fish for " +
-        requested +
-        " creatures because none have been added for that currency yet.\n" +
+        opening +
+        "none have been added for that currency yet.\n" +
         "Available currencies for fishing in this server: " +
         available +
         "\n" +
@@ -478,11 +581,8 @@ public class FishServicesImpl implements FishServices {
     }
 
     return (
-      "<@" +
-      userId +
-      "> cannot fish for " +
-      requested +
-      " creatures because this server's </" +
+      opening +
+      "this server's </" +
       Constants.COMMAND_NAME_RESERVES +
       ":" +
       commandMap.get(Constants.COMMAND_NAME_RESERVES) +
@@ -503,6 +603,29 @@ public class FishServicesImpl implements FishServices {
       ">!\n" +
       fishAgain
     );
+  }
+
+  /** Confirms a changed default on a reply the user did not get a catch from. */
+  private String formatDefaultChangedNote(
+    String ticker,
+    List<CurrencyDto> currencies
+  ) {
+    if (ticker == null) {
+      return (
+        "Your default fishing currency for this server has been cleared, " +
+        "so you will fish for any currency's creatures."
+      );
+    }
+
+    return (
+      "Your default fishing currency for this server is now " +
+      formatCurrencyLabel(ticker, currencies) +
+      "."
+    );
+  }
+
+  private String appendNote(String message, String note) {
+    return note == null ? message : message + "\n\n" + note;
   }
 
   /** A currency rendered as "emoji Name [TICKER]", falling back to the ticker. */
@@ -608,15 +731,16 @@ public class FishServicesImpl implements FishServices {
   private String findCooldownError(
     RequestDto requestDto,
     TransferResponseDto transferResponseDto,
-    Map<String, String> commandMap
+    Map<String, String> commandMap,
+    Optional<AnglerEntity> angler
   ) {
-    Optional<AnglerEntity> anglerTimestamp =
-      anglersService.getAnglerByGuildIdAndUserId(
-        requestDto.getGuildId(),
-        requestDto.getUserId()
-      );
+    if (angler.isEmpty()) {
+      return null;
+    }
 
-    if (anglerTimestamp.isEmpty()) {
+    // An angler that exists only to hold a currency default has never cast a line
+    Date timestamp = angler.get().getTimestamp();
+    if (timestamp == null) {
       return null;
     }
 
@@ -627,7 +751,6 @@ public class FishServicesImpl implements FishServices {
       ? fishingFrequency
       : DEFAULT_FISHING_FREQUENCY_MINUTES;
 
-    Date timestamp = anglerTimestamp.get().getTimestamp();
     long remaining =
       timestamp.getTime() +
       (guildTime * 60 * 1000L) -

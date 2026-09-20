@@ -46,25 +46,36 @@ public class PickupServicesImpl implements PickupServices {
         return baseResponseDto;
       }
       DropEntity drop = drops.get(0);
+      boolean trivia = drop.hasTrivia();
+      String noun = trivia ? "trivia drop" : "drop";
       if (drop.getEndTime().before(new java.util.Date())) {
-        baseResponseDto.setErrorMessage("This drop has ended.");
+        baseResponseDto.setErrorMessage("This " + noun + " has ended.");
         return baseResponseDto;
       }
       List<PickupEntity> pickups = pickupsService.getPickups(
         requestDto.getDropId(),
         null
       );
-      String usersJoinedNote = "\n\nUsers Joined: " + pickups.size();
+      // A trivia drop reports how many have answered, never how many were right.
+      String usersJoinedNote = trivia
+        ? "\n\nAnswers: " + pickups.size()
+        : "\n\nUsers Joined: " + pickups.size();
       if (drop.getUserId().equals(requestDto.getUserId())) {
         baseResponseDto.setErrorMessage(
-          "You cannot enter your own drop!" + usersJoinedNote
+          (trivia
+              ? "You cannot answer your own trivia drop!"
+              : "You cannot enter your own drop!") +
+          usersJoinedNote
         );
         return baseResponseDto;
       }
       for (PickupEntity pickup : pickups) {
         if (pickup.getUserId().equals(requestDto.getUserId())) {
           baseResponseDto.setErrorMessage(
-            "You have already entered this drop!" + usersJoinedNote
+            (trivia
+                ? "You have already answered this trivia drop!"
+                : "You have already entered this drop!") +
+            usersJoinedNote
           );
           return baseResponseDto;
         }
@@ -84,7 +95,23 @@ public class PickupServicesImpl implements PickupServices {
       String maximumEntries = drop.getMaximumEntries();
       BigInteger bigInt = new BigInteger(maximumEntries);
       BigInteger currentSize = BigInteger.valueOf(pickups.size());
-      if (currentSize.compareTo(bigInt) >= 0) {
+      Integer answerIndex = null;
+      if (trivia) {
+        // Anyone may answer; maximumEntries caps winners, checked below.
+        answerIndex = requestDto.getAnswerIndex();
+        List<String> answers = drop.getTrivia().getAnswers();
+        if (
+          answerIndex == null ||
+          answers == null ||
+          answerIndex < 0 ||
+          answerIndex >= answers.size()
+        ) {
+          baseResponseDto.setErrorMessage(
+            "Please choose one of the answer buttons." + usersJoinedNote
+          );
+          return baseResponseDto;
+        }
+      } else if (currentSize.compareTo(bigInt) >= 0) {
         baseResponseDto.setErrorMessage(
           "This drop has reached its maximum number of entries."
         );
@@ -94,18 +121,36 @@ public class PickupServicesImpl implements PickupServices {
         null,
         requestDto.getDropId(),
         requestDto.getUserId(),
-        new java.util.Date()
+        new java.util.Date(),
+        answerIndex
       );
       Optional<PickupEntity> createdPickup = pickupsService.createPickup(
         pickupDto
       );
       if (createdPickup.isEmpty()) {
         baseResponseDto.setErrorMessage(
-          "Error joining drop, please try again later."
+          trivia
+            ? "Error recording your answer, please try again later."
+            : "Error joining drop, please try again later."
         );
         return baseResponseDto;
       }
-      if (bigInt.subtract(currentSize).equals(BigInteger.ONE)) {
+      if (trivia) {
+        // The winner slots are full once enough correct answers are in, so end
+        // the drop now rather than making everyone wait out the timer. Nothing
+        // here tells the answerer whether they were one of them.
+        long correct = pickups
+          .stream()
+          .filter(p -> drop.getTrivia().isCorrect(p.getAnswerIndex()))
+          .count();
+        if (drop.getTrivia().isCorrect(answerIndex)) {
+          correct++;
+        }
+        if (BigInteger.valueOf(correct).compareTo(bigInt) >= 0) {
+          drop.setEndTime(new Date());
+          dropsService.updateDrop(drop.getId(), new DropDto(drop));
+        }
+      } else if (bigInt.subtract(currentSize).equals(BigInteger.ONE)) {
         drop.setEndTime(new Date());
         dropsService.updateDrop(drop.getId(), new DropDto(drop));
       }

@@ -18,6 +18,9 @@ public class AnglerEntity extends BaseEntity {
 
   private Date timestamp;
 
+  /** The currency this user fishes for by default in this guild, or null for any. */
+  private String ticker;
+
   public AnglerEntity() {
     super();
   }
@@ -35,12 +38,24 @@ public class AnglerEntity extends BaseEntity {
     this.timestamp = timestamp;
   }
 
+  public AnglerEntity(
+    String guildId,
+    String userId,
+    boolean resting,
+    Date timestamp,
+    String ticker
+  ) {
+    this(guildId, userId, resting, timestamp);
+    this.ticker = ticker;
+  }
+
   public AnglerEntity(AnglerDto anglers) {
     super(anglers.getId());
     this.guildId = anglers.getGuildId();
     this.userId = anglers.getUserId();
     this.resting = anglers.getResting();
     this.timestamp = new Date();
+    this.ticker = anglers.getTicker();
   }
 
   public String getGuildId() {
@@ -73,5 +88,13 @@ public class AnglerEntity extends BaseEntity {
 
   public void setTimestamp(Date timestamp) {
     this.timestamp = timestamp;
+  }
+
+  public String getTicker() {
+    return ticker;
+  }
+
+  public void setTicker(String ticker) {
+    this.ticker = ticker;
   }
 }

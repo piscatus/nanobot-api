@@ -38,7 +38,9 @@ import org.springframework.stereotype.Service;
  *
  * <p>Deposit detection is driven off the daemon's block height rather than
  * polling the wallet every second: the wallet scan only runs when the chain has
- * actually advanced, which is roughly every two minutes.
+ * actually advanced, which is roughly every two minutes. A lighter look at the
+ * transaction pool runs more often so a deposit can be announced to its owner
+ * before it is mined, although nothing is credited until it is ten blocks deep.
  */
 @Service
 public class MoneroChainAdapter implements ChainAdapter {
@@ -93,6 +95,17 @@ public class MoneroChainAdapter implements ChainAdapter {
    */
   private volatile long lastFullScanMillis = 0L;
 
+  /**
+   * How often to look in the transaction pool for deposits that have not been
+   * mined yet. The wallet scan proper is gated on the chain advancing, which on
+   * Monero is about two minutes, but a user watching for their deposit should
+   * hear about it well before that. Ten seconds keeps the wallet from being
+   * polled every pass while still feeling immediate.
+   */
+  private static final long POOL_SCAN_INTERVAL_MS = 10L * 1000L;
+
+  private volatile long lastPoolScanMillis = 0L;
+
   private static final String ACCOUNT_INDEX = "account_index";
   private static final String ADDRESS_KEY = "address";
   private static final String AMOUNT_KEY = "amount";
@@ -102,6 +115,7 @@ public class MoneroChainAdapter implements ChainAdapter {
   private final CurrenciesService currenciesService;
   private final DepositAddressService depositAddressService;
   private final DepositRecordsRepository depositRecordsRepository;
+  private final DepositNoticeService depositNoticeService;
   private final QueuesService queuesService;
   private final FileLogger fileLogger;
 
@@ -113,12 +127,14 @@ public class MoneroChainAdapter implements ChainAdapter {
     CurrenciesService currenciesService,
     DepositAddressService depositAddressService,
     DepositRecordsRepository depositRecordsRepository,
+    DepositNoticeService depositNoticeService,
     QueuesService queuesService
   ) {
     this.rpc = rpc;
     this.currenciesService = currenciesService;
     this.depositAddressService = depositAddressService;
     this.depositRecordsRepository = depositRecordsRepository;
+    this.depositNoticeService = depositNoticeService;
     this.queuesService = queuesService;
     this.fileLogger = new FileLogger("MoneroChainAdapter");
   }
@@ -283,6 +299,11 @@ public class MoneroChainAdapter implements ChainAdapter {
     boolean fullScan =
       System.currentTimeMillis() - lastFullScanMillis >= FULL_SCAN_INTERVAL_MS;
 
+    // Unmined deposits are announced from the pool independently of the block
+    // gated scan below, so the user hears about a deposit when it is sent rather
+    // than when the next block lands.
+    announcePoolDeposits(currencyEntity, confirmations, commandMap);
+
     // Nothing can have matured since the last pass, and no sweep is due.
     if (!fullScan && safeHeight <= cursor) {
       return;
@@ -368,7 +389,12 @@ public class MoneroChainAdapter implements ChainAdapter {
       return;
     }
 
-    if (transfer.optLong("confirmations", 0L) < confirmations) {
+    long depth = transfer.optLong("confirmations", 0L);
+    if (depth < confirmations) {
+      // Mined but not yet deep enough. Usually already announced from the
+      // pool; this catches a deposit the pool look missed, say across a
+      // restart, so nobody waits ten blocks in silence.
+      announceDeposit(currencyEntity, transfer, depth, confirmations, commandMap);
       return;
     }
     // unlock_time is a separate lock the sender can set on top of the standard
@@ -381,14 +407,8 @@ public class MoneroChainAdapter implements ChainAdapter {
       return;
     }
 
-    JSONObject subaddressIndex = transfer.optJSONObject("subaddr_index");
-    if (subaddressIndex == null) {
-      return;
-    }
-    long minor = subaddressIndex.optLong("minor", -1L);
+    long minor = subaddressMinor(transfer);
     if (minor <= 0L) {
-      // Index 0 is the wallet's own base address, not any user's deposit
-      // address, so funds there are house funds rather than a deposit.
       return;
     }
 
@@ -428,6 +448,155 @@ public class MoneroChainAdapter implements ChainAdapter {
       amount,
       String.valueOf(transfer.optLong("height", 0L)),
       commandMap
+    );
+  }
+
+  /**
+   * The subaddress minor index a transfer paid, or -1 when absent. Index 0 is
+   * the wallet's own base address, not any user's deposit address, so funds
+   * there are house funds rather than a deposit; callers treat anything not
+   * strictly positive as "not a user deposit".
+   */
+  private static long subaddressMinor(JSONObject transfer) {
+    JSONObject subaddressIndex = transfer.optJSONObject("subaddr_index");
+    if (subaddressIndex == null) {
+      return -1L;
+    }
+    return subaddressIndex.optLong("minor", -1L);
+  }
+
+  /**
+   * Announces deposits still sitting in the transaction pool.
+   *
+   * <p>Throttled to {@link #POOL_SCAN_INTERVAL_MS} because the wallet has to
+   * ask the daemon for its pool each time. The pool bucket is not subject to
+   * the height filter the main scan uses, so this is a separate, narrow call.
+   */
+  private void announcePoolDeposits(
+    CurrencyEntity currencyEntity,
+    int confirmations,
+    Map<String, String> commandMap
+  ) {
+    long now = System.currentTimeMillis();
+    if (now - lastPoolScanMillis < POOL_SCAN_INTERVAL_MS) {
+      return;
+    }
+    lastPoolScanMillis = now;
+
+    JSONObject result = rpc.wallet(
+      currencyEntity,
+      "get_transfers",
+      new JSONObject().put("pool", true).put(ACCOUNT_INDEX, 0)
+    );
+    if (result == null) {
+      return;
+    }
+    JSONArray pool = result.optJSONArray("pool");
+    if (pool == null) {
+      return;
+    }
+    for (int i = 0; i < pool.length(); i++) {
+      announceDeposit(
+        currencyEntity,
+        pool.getJSONObject(i),
+        0L,
+        confirmations,
+        commandMap
+      );
+    }
+  }
+
+  /**
+   * Tells the subaddress owner about an incoming transfer that has been seen but
+   * not yet credited, once per deposit.
+   *
+   * <p>Skipped when a deposit record already exists, which means it was credited
+   * on an earlier pass: a "discovered" after a "confirmed" would read as a second
+   * deposit. Transfers with a sender unlock_time are skipped too, because the
+   * credit path refuses them and announcing would promise funds that will not
+   * be credited on schedule. The notice store makes the announcement itself
+   * exactly-once, so re-seeing the transfer on every pass costs nothing.
+   */
+  private void announceDeposit(
+    CurrencyEntity currencyEntity,
+    JSONObject transfer,
+    long depth,
+    int confirmations,
+    Map<String, String> commandMap
+  ) {
+    String ticker = currencyEntity.getTicker();
+    String txid = transfer.optString("txid", null);
+    if (txid == null) {
+      return;
+    }
+    if (transfer.optLong("unlock_time", 0L) > 0L) {
+      return;
+    }
+
+    long minor = subaddressMinor(transfer);
+    if (minor <= 0L) {
+      return;
+    }
+
+    if (
+      depositRecordsRepository.existsByTickerAndTxidAndAddressIndex(
+        ticker,
+        txid,
+        minor
+      )
+    ) {
+      return;
+    }
+
+    Optional<DepositAddressEntity> owner =
+      depositAddressService.getByAddressIndex(ticker, minor);
+    if (owner.isEmpty()) {
+      return;
+    }
+
+    BigInteger amount = BigInteger.valueOf(transfer.optLong(AMOUNT_KEY, 0L));
+    if (amount.signum() <= 0) {
+      return;
+    }
+
+    String userId = owner.get().getUserId();
+    if (
+      !depositNoticeService.recordFirstSighting(
+        ticker,
+        txid,
+        minor,
+        userId,
+        amount.toString()
+      )
+    ) {
+      return;
+    }
+
+    chainLedgerService.notifyDepositDiscovered(
+      currencyEntity,
+      userId,
+      amount.toString(),
+      txid,
+      owner.get().getAddress(),
+      depth,
+      confirmations,
+      commandMap
+    );
+
+    fileLogger.info(
+      "Discovered " +
+      amount +
+      " " +
+      ticker +
+      " for user " +
+      userId +
+      " in " +
+      txid +
+      " (" +
+      depth +
+      " of " +
+      confirmations +
+      " confirmations)"
     );
   }
 
@@ -704,6 +873,16 @@ public class MoneroChainAdapter implements ChainAdapter {
       result.optLong("fee", 0L) +
       " deducted from the amount sent)"
     );
+
+    // Only on a fresh broadcast. The recovery path above cannot tell whether
+    // this was already announced before the crash, and a second "sent" would
+    // look like a second withdrawal.
+    chainLedgerService.notifyWithdrawalSent(
+      currencyEntity,
+      queueEntity,
+      ChainSettings.confirmations(currencyEntity, DEFAULT_CONFIRMATIONS),
+      commandMap
+    );
   }
 
   /**
@@ -937,7 +1116,17 @@ public class MoneroChainAdapter implements ChainAdapter {
     // the outgoing transfer. The wallet does not report a send to its own
     // subaddress as an incoming transfer, so the deposit scanner never sees it,
     // and without this the recipient would be debited-but-never-credited.
-    creditInternalDestination(currencyEntity, queueEntity, transfer, commandMap);
+    //
+    // The ledger credit happens here, before the queue entry is dropped, since
+    // that order is what keeps a crash in between recoverable. Only the user's
+    // deposit notice is held back, so the withdrawal that caused it is
+    // announced first and the two messages read in the order things happened.
+    DeferredDepositNotice deferred = creditInternalDestination(
+      currencyEntity,
+      queueEntity,
+      transfer,
+      commandMap
+    );
 
     Optional<QueueEntity> deleted = queuesService.deleteQueue(
       queueEntity.getId()
@@ -949,18 +1138,43 @@ public class MoneroChainAdapter implements ChainAdapter {
         commandMap
       );
     }
+
+    if (deferred != null) {
+      chainLedgerService.notifyDepositConfirmed(
+        currencyEntity,
+        deferred.userId(),
+        deferred.raw(),
+        deferred.txid(),
+        deferred.address(),
+        deferred.transactionId(),
+        commandMap
+      );
+    }
   }
 
   /**
+   * A deposit that has been credited on the ledger but whose user notice has
+   * been held back, so the caller can send it after the withdrawal notice.
+   */
+  private record DeferredDepositNotice(
+    String userId,
+    String raw,
+    String txid,
+    String address,
+    String transactionId
+  ) {}
+
+  /**
    * Credits the owner of a deposit address that received one of our own
-   * withdrawals.
+   * withdrawals, and returns the notice still owed to them, or null when nothing
+   * was credited.
    *
    * <p>Credits what the destination actually received, which is the requested
    * amount minus the network fee, taken from the transfer's own destination
    * entry rather than recomputed. Guarded by the same depositRecords unique
    * index as a normal deposit, so it cannot double-credit.
    */
-  private void creditInternalDestination(
+  private DeferredDepositNotice creditInternalDestination(
     CurrencyEntity currencyEntity,
     QueueEntity queueEntity,
     JSONObject transfer,
@@ -973,7 +1187,7 @@ public class MoneroChainAdapter implements ChainAdapter {
         queueEntity.getTargetAddress()
       );
     if (recipient.isEmpty()) {
-      return;
+      return null;
     }
 
     String txid = queueEntity.getBlockHash();
@@ -986,7 +1200,7 @@ public class MoneroChainAdapter implements ChainAdapter {
         addressIndex
       )
     ) {
-      return;
+      return null;
     }
 
     BigInteger received = resolveDestinationAmount(
@@ -1001,7 +1215,7 @@ public class MoneroChainAdapter implements ChainAdapter {
         txid +
         "; the recipient has not been credited."
       );
-      return;
+      return null;
     }
 
     String userId = recipient.get().getUserId();
@@ -1017,7 +1231,7 @@ public class MoneroChainAdapter implements ChainAdapter {
     try {
       depositRecordsRepository.insert(record);
     } catch (DuplicateKeyException e) {
-      return;
+      return null;
     }
 
     String transactionId = chainLedgerService.creditDeposit(
@@ -1026,7 +1240,8 @@ public class MoneroChainAdapter implements ChainAdapter {
       received.toString(),
       txid,
       recipient.get().getAddress(),
-      commandMap
+      commandMap,
+      false
     );
     record.setTransactionId(transactionId);
     depositRecordsRepository.save(record);
@@ -1040,6 +1255,21 @@ public class MoneroChainAdapter implements ChainAdapter {
       userId +
       " from internal withdrawal " +
       txid
+    );
+
+    if (transactionId == null) {
+      // The transfer failed and was logged by the ledger service. There is
+      // nothing to announce, and announcing would claim a credit that did not
+      // happen.
+      return null;
+    }
+
+    return new DeferredDepositNotice(
+      userId,
+      received.toString(),
+      txid,
+      recipient.get().getAddress(),
+      transactionId
     );
   }
 

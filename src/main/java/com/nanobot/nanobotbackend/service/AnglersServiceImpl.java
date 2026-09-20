@@ -141,6 +141,7 @@ public class AnglersServiceImpl implements AnglersService {
           anglers.setUserId(anglerDto.getUserId());
           anglers.setResting(anglerDto.getResting());
           anglers.setTimestamp(new Date());
+          anglers.setTicker(anglerDto.getTicker());
 
           AnglerEntity updatedAngler = anglersRepository.save(anglers);
           fileLogger.info(UPDATE_BY_ID + id);
@@ -202,10 +203,8 @@ public class AnglersServiceImpl implements AnglersService {
     AnglerEntity angler;
 
     if (!existingAnglers.isEmpty()) {
-      // If an existing entry is found, update its timestamp
+      // If an existing entry is found, reuse it
       angler = existingAnglers.get(0); // Assuming the first match is what we want
-      angler.setTimestamp(new Date());
-      angler.setResting(true);
     } else {
       // If no entry is found, create a new one
       angler = new AnglerEntity(guildId, userId, true, new Date());
@@ -215,13 +214,69 @@ public class AnglersServiceImpl implements AnglersService {
       angler.setId(id.toHexString());
     }
 
-    // Save the angler update / creation
+    return stampAnglerCatch(angler);
+  }
+
+  /**
+   * Starts the cooldown on an angler the caller already holds.
+   *
+   * <p>Exists so a caller that just wrote the angler does not have to read it
+   * back. Reads use majority read concern, so a document written moments earlier
+   * may not be visible yet, and {@link #updateOrCreateAngler} would take that
+   * miss as licence to insert a second one, violating the unique guildId/userId
+   * index.
+   */
+  @Override
+  public AnglerEntity stampAnglerCatch(AnglerEntity angler) {
+    angler.setTimestamp(new Date());
+    angler.setResting(true);
+
     AnglerEntity updatedAngler = anglersRepository.save(angler);
 
-    // Log the update / creation
     fileLogger.info(UPDATE_BY_ID + updatedAngler.getId());
 
-    // Return the updated or new entry to the database
+    return updatedAngler;
+  }
+
+  /**
+   * Stores the user's default fishing currency for a guild, where a null ticker
+   * clears it.
+   *
+   * <p>A user can set a default before they have ever fished, so this may have
+   * to create the angler. It leaves the angler awake with no timestamp, because
+   * choosing a currency is not a catch: a fresh timestamp would start a cooldown
+   * and resting would queue a reminder for a catch that never happened.
+   */
+  @Override
+  public AnglerEntity setAnglerTicker(
+    String guildId,
+    String userId,
+    String ticker
+  ) {
+    List<AnglerEntity> existingAnglers =
+      anglersRepository.findByGuildIdAndUserId(guildId, userId);
+
+    AnglerEntity angler;
+
+    if (!existingAnglers.isEmpty()) {
+      angler = existingAnglers.get(0);
+    } else {
+      angler = new AnglerEntity(guildId, userId, false, null);
+      ObjectId id = new ObjectId();
+      angler.setId(id.toHexString());
+    }
+
+    angler.setTicker(ticker);
+
+    AnglerEntity updatedAngler = anglersRepository.save(angler);
+
+    fileLogger.info(
+      "Angler " +
+      updatedAngler.getId() +
+      " default currency set to: " +
+      (ticker == null ? "any" : ticker)
+    );
+
     return updatedAngler;
   }
 }

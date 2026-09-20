@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -11,6 +12,7 @@ import com.nanobot.nanobotbackend.dto.BaseResponseDto;
 import com.nanobot.nanobotbackend.dto.DropDto;
 import com.nanobot.nanobotbackend.dto.PickupDto;
 import com.nanobot.nanobotbackend.dto.RequestDto;
+import com.nanobot.nanobotbackend.dto.TriviaQuestionDto;
 import com.nanobot.nanobotbackend.entity.DropEntity;
 import com.nanobot.nanobotbackend.entity.PickupEntity;
 import java.util.ArrayList;
@@ -21,6 +23,7 @@ import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -236,6 +239,138 @@ class PickupServicesImplTest {
   }
 
   @Test
+  void pickupShouldRequireAnswerIndexOnTriviaDrop() {
+    RequestDto request = request("drop1", "user1", Collections.emptyList());
+    DropEntity drop = triviaDrop("owner1");
+
+    when(dropsService.getDrops("drop1")).thenReturn(List.of(drop));
+    when(pickupsService.getPickups("drop1", null)).thenReturn(Collections.emptyList());
+
+    BaseResponseDto result = pickupServicesImpl.pickup(request);
+
+    assertEquals(
+      "Please choose one of the answer buttons.\n\nAnswers: 0",
+      result.getErrorMessage()
+    );
+    verify(pickupsService, never()).createPickup(any(PickupDto.class));
+  }
+
+  @Test
+  void pickupShouldStoreWrongTriviaAnswerWithoutEndingTheDrop() {
+    RequestDto request = request("drop1", "user1", Collections.emptyList());
+    request.setAnswerIndex(0);
+    DropEntity drop = triviaDrop("owner1");
+
+    when(dropsService.getDrops("drop1")).thenReturn(List.of(drop));
+    when(pickupsService.getPickups("drop1", null)).thenReturn(Collections.emptyList());
+    when(pickupsService.createPickup(any(PickupDto.class)))
+      .thenReturn(Optional.of(new PickupEntity()));
+
+    BaseResponseDto result = pickupServicesImpl.pickup(request);
+
+    assertNull(result.getErrorMessage());
+    ArgumentCaptor<PickupDto> captor = ArgumentCaptor.forClass(PickupDto.class);
+    verify(pickupsService).createPickup(captor.capture());
+    assertEquals(0, captor.getValue().getAnswerIndex());
+    assertEquals("drop1", captor.getValue().getDropId());
+    assertEquals("user1", captor.getValue().getUserId());
+    verify(dropsService, never()).updateDrop(any(), any(DropDto.class));
+  }
+
+  @Test
+  void pickupShouldEndTriviaDropWhenCorrectAnswersReachMaximumWinners() {
+    RequestDto request = request("drop1", "user1", Collections.emptyList());
+    request.setAnswerIndex(2);
+    DropEntity drop = triviaDrop("owner1");
+
+    when(dropsService.getDrops("drop1")).thenReturn(List.of(drop));
+    when(pickupsService.getPickups("drop1", null)).thenReturn(Collections.emptyList());
+    when(pickupsService.createPickup(any(PickupDto.class)))
+      .thenReturn(Optional.of(new PickupEntity()));
+    when(dropsService.updateDrop(eq("drop-entity-id"), any(DropDto.class)))
+      .thenReturn(Optional.of(drop));
+
+    BaseResponseDto result = pickupServicesImpl.pickup(request);
+
+    assertNull(result.getErrorMessage());
+    verify(dropsService).updateDrop(eq("drop-entity-id"), any(DropDto.class));
+  }
+
+  @Test
+  void pickupShouldKeepLegacyStringsOnAPlainDrop() {
+    RequestDto request = request("drop1", "user1", Collections.emptyList());
+    request.setAnswerIndex(2);
+    DropEntity drop = validDrop("user1");
+
+    when(dropsService.getDrops("drop1")).thenReturn(List.of(drop));
+    when(pickupsService.getPickups("drop1", null)).thenReturn(Collections.emptyList());
+
+    BaseResponseDto ownDrop = pickupServicesImpl.pickup(request);
+    assertEquals(
+      "You cannot enter your own drop!\n\nUsers Joined: 0",
+      ownDrop.getErrorMessage()
+    );
+
+    DropEntity ended = validDrop("owner1");
+    ended.setEndTime(new Date(System.currentTimeMillis() - 60_000));
+    when(dropsService.getDrops("drop1")).thenReturn(List.of(ended));
+
+    BaseResponseDto endedDrop = pickupServicesImpl.pickup(request);
+    assertEquals("This drop has ended.", endedDrop.getErrorMessage());
+  }
+
+  @Test
+  void pickupShouldReturnTriviaDropEndedWhenEndTimePassed() {
+    RequestDto request = request("drop1", "user1", Collections.emptyList());
+    request.setAnswerIndex(2);
+    DropEntity drop = triviaDrop("owner1");
+    drop.setEndTime(new Date(System.currentTimeMillis() - 60_000));
+
+    when(dropsService.getDrops("drop1")).thenReturn(List.of(drop));
+
+    BaseResponseDto result = pickupServicesImpl.pickup(request);
+
+    assertEquals("This trivia drop has ended.", result.getErrorMessage());
+  }
+
+  @Test
+  void pickupShouldReturnErrorWhenUserAnswersOwnTriviaDrop() {
+    RequestDto request = request("drop1", "user1", Collections.emptyList());
+    request.setAnswerIndex(2);
+    DropEntity drop = triviaDrop("user1");
+
+    when(dropsService.getDrops("drop1")).thenReturn(List.of(drop));
+    when(pickupsService.getPickups("drop1", null)).thenReturn(Collections.emptyList());
+
+    BaseResponseDto result = pickupServicesImpl.pickup(request);
+
+    assertEquals(
+      "You cannot answer your own trivia drop!\n\nAnswers: 0",
+      result.getErrorMessage()
+    );
+  }
+
+  @Test
+  void pickupShouldReturnErrorWhenUserAlreadyAnsweredTriviaDrop() {
+    RequestDto request = request("drop1", "user1", Collections.emptyList());
+    request.setAnswerIndex(2);
+    DropEntity drop = triviaDrop("owner1");
+    PickupEntity existingPickup = new PickupEntity();
+    existingPickup.setUserId("user1");
+
+    when(dropsService.getDrops("drop1")).thenReturn(List.of(drop));
+    when(pickupsService.getPickups("drop1", null))
+      .thenReturn(List.of(existingPickup));
+
+    BaseResponseDto result = pickupServicesImpl.pickup(request);
+
+    assertEquals(
+      "You have already answered this trivia drop!\n\nAnswers: 1",
+      result.getErrorMessage()
+    );
+  }
+
+  @Test
   void pickupShouldReturnUnknownErrorWhenExceptionThrown() {
     RequestDto request = request("drop1", "user1", null);
     when(dropsService.getDrops("drop1")).thenThrow(new RuntimeException("DB error"));
@@ -276,6 +411,16 @@ class PickupServicesImplTest {
     drop.setEndTime(new Date(System.currentTimeMillis() + 60_000));
     drop.setMaximumEntries("100");
     drop.setRequiredRole("0");
+    return drop;
+  }
+
+  private DropEntity triviaDrop(String ownerId) {
+    DropEntity drop = validDrop(ownerId);
+    drop.setMaximumEntries("1");
+    TriviaQuestionDto trivia = new TriviaQuestionDto();
+    trivia.setAnswers(List.of("A", "B", "C", "D"));
+    trivia.setCorrectIndex(2);
+    drop.setTrivia(trivia);
     return drop;
   }
 }

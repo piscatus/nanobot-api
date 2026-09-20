@@ -11,6 +11,9 @@ public class PickupDto extends BaseDto {
 
   private Date timestamp;
 
+  /** Which answer button was pressed on a trivia drop; null on a plain drop. */
+  private Integer answerIndex;
+
   public PickupDto() {
     super();
   }
@@ -22,11 +25,31 @@ public class PickupDto extends BaseDto {
     this.timestamp = timestamp;
   }
 
+  public PickupDto(
+    String id,
+    String dropId,
+    String userId,
+    Date timestamp,
+    Integer answerIndex
+  ) {
+    this(id, dropId, userId, timestamp);
+    this.answerIndex = answerIndex;
+  }
+
   public PickupDto(PickupEntity entity) {
     super(entity.getId());
     this.dropId = entity.getDropId();
     this.userId = entity.getUserId();
     this.timestamp = entity.getTimestamp();
+    this.answerIndex = entity.getAnswerIndex();
+  }
+
+  public Integer getAnswerIndex() {
+    return answerIndex;
+  }
+
+  public void setAnswerIndex(Integer answerIndex) {
+    this.answerIndex = answerIndex;
   }
 
   public String getDropId() {

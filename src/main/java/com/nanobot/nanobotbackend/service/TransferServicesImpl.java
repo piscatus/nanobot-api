@@ -10,13 +10,16 @@ import com.nanobot.nanobotbackend.dto.ItemDto;
 import com.nanobot.nanobotbackend.dto.RequestDto;
 import com.nanobot.nanobotbackend.dto.TransferDto;
 import com.nanobot.nanobotbackend.dto.TransferResponseDto;
+import com.nanobot.nanobotbackend.dto.TriviaQuestionDto;
 import com.nanobot.nanobotbackend.dto.UserWalletsResponseDto;
 import com.nanobot.nanobotbackend.dto.WalletDto;
 import com.nanobot.nanobotbackend.entity.DropEntity;
+import com.nanobot.nanobotbackend.entity.TriviaEntity;
 import com.nanobot.nanobotbackend.util.Constants;
 import com.nanobot.nanobotbackend.util.LoggingUtil;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -52,6 +55,10 @@ public class TransferServicesImpl implements TransferServices {
 
   @Autowired
   private TransferExecutorService transferExecutorService;
+
+  /** Field-injected, like the executor, so the test constructor is unchanged. */
+  @Autowired
+  private TriviasService triviasService;
 
   public TransferServicesImpl(
     ActivitiesService activitiesService,
@@ -153,8 +160,94 @@ public class TransferServicesImpl implements TransferServices {
 
   @Override
   public TransferResponseDto drop(RequestDto requestDto) {
+    return createDrop(requestDto, Constants.COMMAND_NAME_DROP, false);
+  }
+
+  /**
+   * A trivia drop is a drop with a question attached: same escrow, same
+   * timer, but only correct answers can win. It has no random-winner mode
+   * and no role requirement, and {@code users} caps winners rather than
+   * entries, so the shared path is told which flavour it is building.
+   */
+  @Override
+  public TransferResponseDto triviadrop(RequestDto requestDto) {
+    return createDrop(requestDto, Constants.COMMAND_NAME_TRIVIADROP, true);
+  }
+
+  private static boolean isBlank(String value) {
+    return value == null || value.trim().isEmpty();
+  }
+
+  /** Why no question could be found, naming whichever filters were asked for. */
+  /**
+   * Null when seconds are fine. The 10-second floor applies only when minutes
+   * is not a positive duration, so 2 minutes and 5 seconds is valid.
+   */
+  static String triviaSecondsError(int minutes, int seconds) {
+    if (seconds < 0 || seconds > Constants.maximumTriviaSeconds) {
+      return (
+        "Trivia duration seconds must be between `0` and `" +
+        Constants.maximumTriviaSeconds +
+        "`."
+      );
+    }
+    if (
+      minutes <= 0 &&
+      seconds > 0 &&
+      seconds < Constants.minimumTriviaSeconds
+    ) {
+      return (
+        "Trivia drops must last at least `" +
+        Constants.minimumTriviaSeconds +
+        "` seconds when duration_minutes is not set."
+      );
+    }
+    return null;
+  }
+
+  static String noTriviaQuestionsMessage(String category, String difficulty) {
+    if (category == null && difficulty == null) {
+      return "There are no trivia questions available right now, sorry!";
+    }
+    StringBuilder message = new StringBuilder("There are no ");
+    if (difficulty != null) {
+      message.append(difficulty).append(" ");
+    }
+    message.append("trivia questions");
+    if (category != null) {
+      message.append(" in the category `").append(category).append("`");
+    }
+    return message
+      .append(", sorry! Try another ")
+      .append(
+        category != null && difficulty != null
+          ? "category or difficulty."
+          : category != null ? "category." : "difficulty."
+      )
+      .toString();
+  }
+
+  private TransferResponseDto createDrop(
+    RequestDto requestDto,
+    String commandName,
+    boolean trivia
+  ) {
     try {
-      LoggingUtil.requestLogging(Constants.COMMAND_NAME_DROP, requestDto);
+      LoggingUtil.requestLogging(commandName, requestDto);
+
+      if (trivia) {
+        requestDto.setRandom(0);
+        requestDto.setRoleId("0");
+      }
+      if (requestDto.getUsers() == null) {
+        requestDto.setUsers(0);
+      }
+      // What the users option limits: joiners on a drop, winners on trivia.
+      String usersNoun = trivia ? "winners" : "users";
+      String entriesNoun = trivia ? "winners" : "entries";
+      int defaultDuration = trivia
+        ? Constants.defaultTriviaDropDuration
+        : Constants.defaultDropDuration;
 
       TransferResponseDto transferResponseDto = new TransferResponseDto();
 
@@ -179,7 +272,7 @@ public class TransferServicesImpl implements TransferServices {
 
       if (
         !coreServices.commandsService.setCommands(
-          Constants.COMMAND_NAME_DROP,
+          commandName,
           requestDto.getUserId(),
           transferResponseDto::setCommands
         )
@@ -202,7 +295,7 @@ public class TransferServicesImpl implements TransferServices {
 
       transferResponseDto.setPrimaryTransfer(
         transferService.processInputs(
-          Constants.COMMAND_NAME_DROP,
+          commandName,
           transferResponseDto::setErrorMessage,
           commandMap,
           requestDto.getGuildId(),
@@ -249,9 +342,13 @@ public class TransferServicesImpl implements TransferServices {
             0
           ) {
             transferResponseDto.setErrorMessage(
-              "The number of users specified (" +
+              "The number of " +
+              usersNoun +
+              " specified (" +
               requestDto.getUsers() +
-              ") exceeds the maximum entries (" +
+              ") exceeds the maximum " +
+              entriesNoun +
+              " (" +
               maximumEntries.toString() +
               ") calculated from your input: `" +
               requestDto.getInput() +
@@ -312,22 +409,33 @@ public class TransferServicesImpl implements TransferServices {
             : requestDto.getUsers().toString();
       }
 
-      // Determine the end time
+      // Determine the end time. Trivia may add leftover seconds; a seconds-only
+      // request must not fall through to the 3-minute default.
+      int minutes =
+        requestDto.getDuration() == null ? 0 : requestDto.getDuration();
+      int seconds =
+        requestDto.getSeconds() == null ? 0 : requestDto.getSeconds();
+      if (trivia) {
+        String secondsError = triviaSecondsError(minutes, seconds);
+        if (secondsError != null) {
+          transferResponseDto.setErrorMessage(secondsError);
+          return transferResponseDto;
+        }
+        if (minutes == 0 && seconds == 0) {
+          minutes = defaultDuration;
+        }
+      } else if (minutes == 0) {
+        minutes = defaultDuration;
+      }
       Calendar calendar = Calendar.getInstance();
       calendar.setTime(new Date());
-      calendar.add(
-        Calendar.MINUTE,
-        (requestDto.getDuration() != 0)
-          ? requestDto.getDuration()
-          : Constants.defaultDropDuration
-      );
+      calendar.add(Calendar.MINUTE, minutes);
+      calendar.add(Calendar.SECOND, seconds);
 
       transferResponseDto.setDrop(
         new DropDto(
           requestDto.getChannelId(),
-          requestDto.getDuration() == 0
-            ? Constants.defaultDropDuration
-            : requestDto.getDuration(),
+          minutes,
           calendar.getTime(),
           requestDto.getGuildId(),
           requestDto.getInput(),
@@ -340,6 +448,52 @@ public class TransferServicesImpl implements TransferServices {
           requestDto.getUserId()
         )
       );
+      if (trivia && seconds > 0) {
+        transferResponseDto.getDrop().setSeconds(seconds);
+      }
+
+      // Settled before the confirmation prompt so the user is never asked to
+      // confirm a drop that cannot be filled, and so the preview can show what
+      // was asked for. The question itself is only chosen after confirmation.
+      String category = null;
+      String difficulty = null;
+      if (trivia) {
+        if (!isBlank(requestDto.getCategory())) {
+          Optional<String> resolved = triviasService.resolveCategory(
+            requestDto.getCategory()
+          );
+          if (resolved.isEmpty()) {
+            transferResponseDto.setErrorMessage(
+              "There are no trivia questions in the category `" +
+              requestDto.getCategory().trim() +
+              "`, sorry! Pick a category from the suggestions."
+            );
+            return transferResponseDto;
+          }
+          category = resolved.get();
+        }
+        if (!isBlank(requestDto.getDifficulty())) {
+          difficulty = requestDto.getDifficulty().trim().toLowerCase();
+          if (!Constants.TRIVIA_DIFFICULTIES.contains(difficulty)) {
+            transferResponseDto.setErrorMessage(
+              "Trivia difficulty must be one of `easy`, `medium` or `hard`."
+            );
+            return transferResponseDto;
+          }
+        }
+        if (triviasService.pickQuestion(category, difficulty).isEmpty()) {
+          transferResponseDto.setErrorMessage(
+            noTriviaQuestionsMessage(category, difficulty)
+          );
+          return transferResponseDto;
+        }
+        // What was requested, shown on the confirmation and receipt embeds.
+        // Replaced by the chosen question once the drop is created.
+        TriviaQuestionDto requested = new TriviaQuestionDto();
+        requested.setCategory(category);
+        requested.setDifficulty(difficulty);
+        transferResponseDto.getDrop().setTrivia(requested);
+      }
 
       if (
         transferResponseDto.getPrimaryTransfer().getPricey() &&
@@ -349,8 +503,30 @@ public class TransferServicesImpl implements TransferServices {
         return transferResponseDto;
       }
 
+      // Chosen only once the drop is really being created, so a confirmation
+      // preview never consumes a question. Marked used after the drop exists.
+      TriviaEntity triviaEntity = null;
+      if (trivia) {
+        Optional<TriviaEntity> picked = triviasService.pickQuestion(
+          category,
+          difficulty
+        );
+        if (picked.isEmpty()) {
+          transferResponseDto.setErrorMessage(
+            noTriviaQuestionsMessage(category, difficulty)
+          );
+          return transferResponseDto;
+        }
+        triviaEntity = picked.get();
+        transferResponseDto
+          .getDrop()
+          .setTrivia(
+            TriviaQuestionDto.fromEntity(triviaEntity, new SecureRandom())
+          );
+      }
+
       TransferResponseDto transfer = transferExecutorService.executeTransfer(
-        Constants.COMMAND_NAME_DROP,
+        commandName,
         requestDto.getGuildId(),
         requestDto.getChannelId(),
         requestDto.getUserId(),
@@ -363,9 +539,7 @@ public class TransferServicesImpl implements TransferServices {
       if (transfer.getCompletedPrimaryTransfers() != null) {
         DropDto newDrop = new DropDto(
           requestDto.getChannelId(),
-          requestDto.getDuration() == 0
-            ? Constants.defaultDropDuration
-            : requestDto.getDuration(),
+          minutes,
           calendar.getTime(),
           requestDto.getGuildId(),
           requestDto.getInput(),
@@ -380,10 +554,18 @@ public class TransferServicesImpl implements TransferServices {
         // Persisted so the closing embed, which is built long after the command
         // returns, can name the creator without relying on Discord's cache.
         newDrop.setUsername(requestDto.getUsername());
+        newDrop.setTrivia(transferResponseDto.getDrop().getTrivia());
+        if (trivia && seconds > 0) {
+          newDrop.setSeconds(seconds);
+        }
 
         DropEntity dropEntity = dropsService.createDrop(newDrop).get();
 
         transfer.getDrop().setId(dropEntity.getId());
+
+        if (triviaEntity != null) {
+          triviasService.markUsed(triviaEntity.getId());
+        }
 
         activitiesService.updateOrCreateActivity(
           requestDto.getGuildId(),
@@ -394,7 +576,7 @@ public class TransferServicesImpl implements TransferServices {
 
       return transferResponseDto;
     } catch (Exception e) {
-      LoggingUtil.errorLogging(Constants.COMMAND_NAME_DROP, e);
+      LoggingUtil.errorLogging(commandName, e);
       return new TransferResponseDto(Constants.unknownError);
     }
   }

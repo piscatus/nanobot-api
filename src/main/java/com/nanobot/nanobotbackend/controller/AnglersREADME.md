@@ -65,7 +65,8 @@ BODY:
 "guildId": "83746253",
 "channelId": "62548757",
 "userId": "43210124",
-"timestamp": "2024-10-07T23:20:50.203+00:00"
+"timestamp": "2024-10-07T23:20:50.203+00:00",
+"ticker": "XNO"
 }
 
 ---
@@ -73,3 +74,16 @@ BODY:
 ENDPOINT:
 Method=DELETE
 URL=http://<container>:<port>/anglers/651e02160156b6630c3a6586
+
+-----------------------------------------------
+
+TICKER
+
+The user's default fishing currency in this guild, set by picking a currency on
+/fish and cleared by picking Any. Null means they fish for anything.
+
+This PUT overwrites every field, so omitting ticker clears the user's default.
+
+An angler that only ever set a default has no timestamp and is not resting: it
+records a preference, not a catch. A timestamp is what starts a cooldown, and
+resting is what queues a reminder, so a preference must not set either.

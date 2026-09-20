@@ -34,10 +34,12 @@ import org.springframework.stereotype.Service;
  * so deposits arrive already inside the wallet and there is no per-deposit
  * sweep to pay for. The only fee is on withdrawal.
  *
- * <p>Deposit detection is a {@code listsinceblock} walk gated on the chain
- * actually having advanced, which on Bitcoin means roughly every ten minutes.
- * No websocket is involved; bitcoind hands back a confirmation count per entry,
- * so maturity is a comparison rather than something to track.
+ * <p>Deposit detection is a {@code listsinceblock} walk from just below the
+ * cursor. It runs every pass: crediting only happens as the chain advances,
+ * which on Bitcoin means roughly every ten minutes, but a deposit sitting in
+ * the mempool is announced to its owner as soon as the wallet sees it. No
+ * websocket is involved; bitcoind hands back a confirmation count per entry, so
+ * maturity is a comparison rather than something to track.
  *
  * <p>The node carries no txindex, so every lookup here is deliberately
  * wallet-scoped. {@code getrawtransaction} against an arbitrary hash would fail
@@ -123,12 +125,23 @@ public class BitcoinChainAdapter implements ChainAdapter {
   /** Deliberately not persisted: a restart forces a full sweep, which is what is wanted after downtime. */
   private volatile long lastFullScanMillis = 0L;
 
+  /**
+   * How often to scan when no block has arrived, purely to spot deposits that
+   * are still in the mempool. Ten seconds keeps the wallet from being polled
+   * every pass while still telling a user about their deposit almost as soon as
+   * it is broadcast.
+   */
+  private static final long DISCOVERY_SCAN_INTERVAL_MS = 10L * 1000L;
+
+  private volatile long lastDiscoveryScanMillis = 0L;
+
   private volatile long lastFeeRefreshMillis = 0L;
 
   private final BitcoinRpcClient rpc;
   private final CurrenciesService currenciesService;
   private final DepositAddressService depositAddressService;
   private final DepositRecordsRepository depositRecordsRepository;
+  private final DepositNoticeService depositNoticeService;
   private final QueuesService queuesService;
   private final FileLogger fileLogger;
 
@@ -145,12 +158,14 @@ public class BitcoinChainAdapter implements ChainAdapter {
     CurrenciesService currenciesService,
     DepositAddressService depositAddressService,
     DepositRecordsRepository depositRecordsRepository,
+    DepositNoticeService depositNoticeService,
     QueuesService queuesService
   ) {
     this.rpc = rpc;
     this.currenciesService = currenciesService;
     this.depositAddressService = depositAddressService;
     this.depositRecordsRepository = depositRecordsRepository;
+    this.depositNoticeService = depositNoticeService;
     this.queuesService = queuesService;
     this.fileLogger = new FileLogger("BitcoinChainAdapter");
   }
@@ -310,10 +325,20 @@ public class BitcoinChainAdapter implements ChainAdapter {
     boolean fullScan =
       System.currentTimeMillis() - lastFullScanMillis >= FULL_SCAN_INTERVAL_MS;
 
-    // Nothing can have matured since the last pass, and no sweep is due.
-    if (!fullScan && safeHeight <= cursor) {
+    // Even when nothing can have matured the scan still runs now and then,
+    // because listsinceblock is also how a brand new, still unconfirmed deposit
+    // is first seen, and the user is told about that when it shows up rather
+    // than an hour later when it is credited. Crediting stays gated on the
+    // confirmation count regardless.
+    long now = System.currentTimeMillis();
+    if (
+      !fullScan &&
+      safeHeight <= cursor &&
+      now - lastDiscoveryScanMillis < DISCOVERY_SCAN_INTERVAL_MS
+    ) {
       return;
     }
+    lastDiscoveryScanMillis = now;
 
     // A full sweep passes no starting block, which re-offers the wallet's whole
     // history. Anything already credited is rejected by the depositRecords
@@ -343,6 +368,14 @@ public class BitcoinChainAdapter implements ChainAdapter {
       creditDeposit(currencyEntity, deposit, commandMap);
     }
 
+    for (Deposit deposit : groupImmatureDeposits(
+      transactions,
+      confirmations
+    )
+      .values()) {
+      announceDeposit(currencyEntity, deposit, confirmations, commandMap);
+    }
+
     if (fullScan) {
       lastFullScanMillis = System.currentTimeMillis();
       fileLogger.info(
@@ -368,14 +401,21 @@ public class BitcoinChainAdapter implements ChainAdapter {
    * One credited deposit: everything a single transaction paid to a single
    * address, summed.
    */
-  record Deposit(String txid, String address, BigInteger amount, long height) {
+  record Deposit(
+    String txid,
+    String address,
+    BigInteger amount,
+    long height,
+    long confirmations
+  ) {
     Deposit plus(BigInteger more) {
-      return new Deposit(txid, address, amount.add(more), height);
+      return new Deposit(txid, address, amount.add(more), height, confirmations);
     }
   }
 
   /**
-   * Collapses wallet entries into one deposit per transaction and address.
+   * Collapses wallet entries into one deposit per transaction and address,
+   * keeping only those with enough confirmations to be credited.
    *
    * <p>A transaction may legally pay the same address in more than one output,
    * and bitcoind lists each separately. Deposit records are keyed on
@@ -388,6 +428,31 @@ public class BitcoinChainAdapter implements ChainAdapter {
     JSONArray transactions,
     int confirmations
   ) {
+    return groupDeposits(transactions, depth -> depth >= confirmations);
+  }
+
+  /**
+   * The complement of {@link #groupDeposits}: deposits the wallet has seen that
+   * are not yet old enough to credit, from the mempool up to one block short.
+   *
+   * <p>Negative counts are excluded. bitcoind reports those for a transaction
+   * that conflicts with one already mined, and it will never be credited, so
+   * announcing it would promise funds that are not coming.
+   */
+  static Map<String, Deposit> groupImmatureDeposits(
+    JSONArray transactions,
+    int confirmations
+  ) {
+    return groupDeposits(
+      transactions,
+      depth -> depth >= 0L && depth < confirmations
+    );
+  }
+
+  private static Map<String, Deposit> groupDeposits(
+    JSONArray transactions,
+    java.util.function.LongPredicate depthAccepted
+  ) {
     Map<String, Deposit> deposits = new LinkedHashMap<>();
     for (int i = 0; i < transactions.length(); i++) {
       JSONObject entry = transactions.optJSONObject(i);
@@ -397,7 +462,8 @@ public class BitcoinChainAdapter implements ChainAdapter {
       if (!"receive".equals(entry.optString(CATEGORY_KEY, null))) {
         continue;
       }
-      if (entry.optLong(CONFIRMATIONS_KEY, 0L) < confirmations) {
+      long depth = entry.optLong(CONFIRMATIONS_KEY, 0L);
+      if (!depthAccepted.test(depth)) {
         continue;
       }
       String txid = entry.optString(TXID_KEY, null);
@@ -413,12 +479,91 @@ public class BitcoinChainAdapter implements ChainAdapter {
         txid,
         address,
         amount,
-        entry.optLong("blockheight", 0L)
+        entry.optLong("blockheight", 0L),
+        depth
       );
       deposits.merge(txid + "|" + address, deposit, (a, b) -> a.plus(b.amount())
       );
     }
     return deposits;
+  }
+
+  /**
+   * Tells the address owner about a deposit that has been seen but not yet
+   * credited, once.
+   *
+   * <p>Skipped when a deposit record already exists: that means it was credited
+   * on an earlier pass and this is a re-scan seeing a stale confirmation count,
+   * and a "discovered" notice after a "confirmed" one would read as a second
+   * deposit. The notice store then makes the announcement itself exactly-once.
+   */
+  private void announceDeposit(
+    CurrencyEntity currencyEntity,
+    Deposit deposit,
+    int confirmations,
+    Map<String, String> commandMap
+  ) {
+    String ticker = currencyEntity.getTicker();
+
+    Optional<DepositAddressEntity> owner = depositAddressService.getByAddress(
+      ticker,
+      deposit.address()
+    );
+    if (owner.isEmpty()) {
+      return;
+    }
+
+    Long addressIndex = owner.get().getAddressIndex();
+    String userId = owner.get().getUserId();
+
+    if (
+      depositRecordsRepository.existsByTickerAndTxidAndAddressIndex(
+        ticker,
+        deposit.txid(),
+        addressIndex
+      )
+    ) {
+      return;
+    }
+
+    if (
+      !depositNoticeService.recordFirstSighting(
+        ticker,
+        deposit.txid(),
+        addressIndex,
+        userId,
+        deposit.amount().toString()
+      )
+    ) {
+      return;
+    }
+
+    chainLedgerService.notifyDepositDiscovered(
+      currencyEntity,
+      userId,
+      deposit.amount().toString(),
+      deposit.txid(),
+      deposit.address(),
+      deposit.confirmations(),
+      confirmations,
+      commandMap
+    );
+
+    fileLogger.info(
+      "Discovered " +
+      deposit.amount() +
+      " " +
+      ticker +
+      " for user " +
+      userId +
+      " in " +
+      deposit.txid() +
+      " (" +
+      deposit.confirmations() +
+      " of " +
+      confirmations +
+      " confirmations)"
+    );
   }
 
   /**
@@ -650,6 +795,16 @@ public class BitcoinChainAdapter implements ChainAdapter {
       txid +
       " for queue #" +
       queueEntity.getId()
+    );
+
+    // Only on a fresh broadcast. The recovery path above cannot tell whether
+    // this was already announced before the crash, and a second "sent" would
+    // look like a second withdrawal.
+    chainLedgerService.notifyWithdrawalSent(
+      currencyEntity,
+      queueEntity,
+      ChainSettings.confirmations(currencyEntity, DEFAULT_CONFIRMATIONS),
+      commandMap
     );
   }
 

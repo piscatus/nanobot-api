@@ -20,3 +20,14 @@ BODY:
      "userId": "123",
      "userRoles": ["111", "222", "333"]
 }
+
+On a trivia drop the same endpoint also accepts `answerIndex` (the 0-based
+button that was pressed). Omit it on a plain drop.
+
+BODY (trivia drop):
+{
+     "dropId": "321",
+     "userId": "123",
+     "userRoles": ["111", "222", "333"],
+     "answerIndex": 2
+}

@@ -668,8 +668,15 @@ public class TransferServiceImpl implements TransferService {
       numberStr.equalsIgnoreCase("all")
     ) {
       List<CreatureEntity> creatures = creaturesService.getCreatures();
+      // A creature whose currency is disabled would be rejected by
+      // processCreatureWithAmount, aborting the whole "all" transfer. Skip
+      // it instead so a hidden currency stays invisible to everyone else.
+      Set<String> enabledTickers = enabledTickers();
       AtomicReference<String> updated = new AtomicReference<>();
       for (CreatureEntity creature : creatures) {
+        if (!enabledTickers.contains(upper(creature.getTicker()))) {
+          continue;
+        }
         if (
           !processCreatureWithAmount(
             updated::set,
@@ -735,6 +742,21 @@ public class TransferServiceImpl implements TransferService {
     return false;
   }
 
+  /** Upper-cased tickers of every currency that is currently enabled. */
+  private Set<String> enabledTickers() {
+    Set<String> tickers = new HashSet<>();
+    for (CurrencyEntity currency : currenciesService.getCurrencies(null)) {
+      if (currency.getEnabled() && currency.getTicker() != null) {
+        tickers.add(upper(currency.getTicker()));
+      }
+    }
+    return tickers;
+  }
+
+  private static String upper(String value) {
+    return value == null ? "" : value.toUpperCase();
+  }
+
   private boolean processCurrencyWithAmount(
     Consumer<String> setError,
     TransferDto dto,
@@ -751,6 +773,11 @@ public class TransferServiceImpl implements TransferService {
       List<CurrencyEntity> currencies = currenciesService.getCurrencies(null);
       AtomicReference<String> updated = new AtomicReference<>();
       for (CurrencyEntity currency : currencies) {
+        // Same reasoning as the "all creatures" path: a disabled currency is
+        // not the user's to move, so leave it out rather than fail the lot.
+        if (!currency.getEnabled()) {
+          continue;
+        }
         if (
           !processCurrencyWithAmount(
             updated::set,

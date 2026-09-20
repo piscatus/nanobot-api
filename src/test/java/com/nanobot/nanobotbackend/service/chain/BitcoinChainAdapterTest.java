@@ -172,6 +172,73 @@ class BitcoinChainAdapterTest {
   }
 
   /**
+   * The immature grouping is the mirror image: it is how a deposit is announced
+   * before it can be credited, so it must pick up exactly what the credit path
+   * leaves behind and nothing the credit path would take.
+   */
+  @Test
+  void immatureGroupingShouldTakeMempoolAndShallowDepositsOnly()
+    throws JSONException {
+    JSONArray transactions = new JSONArray()
+      .put(entry("receive", "mempool", "bc1qaaa", "0.1", 0))
+      .put(entry("receive", "shallow", "bc1qbbb", "0.2", 5))
+      .put(entry("receive", "matured", "bc1qccc", "0.3", 6));
+
+    Map<String, Deposit> immature = BitcoinChainAdapter.groupImmatureDeposits(
+      transactions,
+      6
+    );
+    Map<String, Deposit> matured = BitcoinChainAdapter.groupDeposits(
+      transactions,
+      6
+    );
+
+    assertEquals(2, immature.size());
+    assertTrue(immature.containsKey("mempool|bc1qaaa"));
+    assertTrue(immature.containsKey("shallow|bc1qbbb"));
+    assertEquals(0L, immature.get("mempool|bc1qaaa").confirmations());
+    assertEquals(5L, immature.get("shallow|bc1qbbb").confirmations());
+
+    assertEquals(1, matured.size());
+    assertTrue(matured.containsKey("matured|bc1qccc"));
+  }
+
+  /**
+   * A negative count is bitcoind's way of saying the transaction conflicts with
+   * one that was mined. It will never confirm, so it must not be announced as a
+   * deposit on its way.
+   */
+  @Test
+  void conflictedDepositsShouldNotBeAnnounced() throws JSONException {
+    JSONArray transactions = new JSONArray()
+      .put(entry("receive", "tx1", "bc1qaaa", "0.5", -1));
+
+    assertTrue(
+      BitcoinChainAdapter.groupImmatureDeposits(transactions, 6).isEmpty()
+    );
+    assertTrue(BitcoinChainAdapter.groupDeposits(transactions, 6).isEmpty());
+  }
+
+  @Test
+  void immatureOutputsToOneAddressShouldBeSummedLikeMaturedOnes()
+    throws JSONException {
+    JSONArray transactions = new JSONArray()
+      .put(entry("receive", "tx1", "bc1qaaa", "0.5", 0))
+      .put(entry("receive", "tx1", "bc1qaaa", "0.25", 0));
+
+    Map<String, Deposit> immature = BitcoinChainAdapter.groupImmatureDeposits(
+      transactions,
+      6
+    );
+
+    assertEquals(1, immature.size());
+    assertEquals(
+      BigInteger.valueOf(75000000L),
+      immature.values().iterator().next().amount()
+    );
+  }
+
+  /**
    * The wallet reports both sides of an internal transfer. Only the receive side
    * is a deposit; counting the send would credit the hot wallet's own spend.
    */

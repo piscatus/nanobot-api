@@ -13,6 +13,8 @@ public class AnglerDto extends BaseDto {
 
   private Date timestamp;
 
+  private String ticker;
+
   public AnglerDto() {
     super();
   }
@@ -23,6 +25,7 @@ public class AnglerDto extends BaseDto {
     this.userId = entity.getUserId();
     this.resting = entity.getResting();
     this.timestamp = entity.getTimestamp();
+    this.ticker = entity.getTicker();
   }
 
   public String getGuildId() {
@@ -55,5 +58,13 @@ public class AnglerDto extends BaseDto {
 
   public void setTimestamp(Date timestamp) {
     this.timestamp = timestamp;
+  }
+
+  public String getTicker() {
+    return ticker;
+  }
+
+  public void setTicker(String ticker) {
+    this.ticker = ticker;
   }
 }

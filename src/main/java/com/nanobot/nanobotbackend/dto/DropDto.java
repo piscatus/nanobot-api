@@ -9,6 +9,9 @@ public class DropDto extends BaseDto {
 
   private Integer duration;
 
+  /** Leftover seconds on a trivia drop; null on plain drops and on whole minutes. */
+  private Integer seconds;
+
   private Date endTime;
 
   private String guildId;
@@ -33,6 +36,9 @@ public class DropDto extends BaseDto {
 
   private String username;
 
+  /** Present only on trivia drops; see {@link TriviaQuestionDto}. */
+  private TriviaQuestionDto trivia;
+
   public DropDto() {
     super();
   }
@@ -41,6 +47,7 @@ public class DropDto extends BaseDto {
     super(entity.getId());
     this.channelId = entity.getChannelId();
     this.duration = entity.getDuration();
+    this.seconds = entity.getSeconds();
     this.endTime = entity.getEndTime();
     this.guildId = entity.getGuildId();
     this.input = entity.getInput();
@@ -53,6 +60,7 @@ public class DropDto extends BaseDto {
     this.transfer = entity.getTransfer();
     this.userId = entity.getUserId();
     this.username = entity.getUsername();
+    this.trivia = entity.getTrivia();
   }
 
   public DropDto(
@@ -98,6 +106,14 @@ public class DropDto extends BaseDto {
 
   public void setDuration(Integer duration) {
     this.duration = duration;
+  }
+
+  public Integer getSeconds() {
+    return seconds;
+  }
+
+  public void setSeconds(Integer seconds) {
+    this.seconds = seconds;
   }
 
   public Date getEndTime() {
@@ -194,5 +210,13 @@ public class DropDto extends BaseDto {
 
   public void setUsername(String username) {
     this.username = username;
+  }
+
+  public TriviaQuestionDto getTrivia() {
+    return trivia;
+  }
+
+  public void setTrivia(TriviaQuestionDto trivia) {
+    this.trivia = trivia;
   }
 }

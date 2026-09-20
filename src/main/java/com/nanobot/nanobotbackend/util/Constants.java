@@ -28,6 +28,7 @@ public class Constants {
   public static final String COMMAND_NAME_SEND = "send";
   public static final String COMMAND_NAME_SERVER = "server";
   public static final String COMMAND_NAME_TRANSACTIONS = "transactions";
+  public static final String COMMAND_NAME_TRIVIADROP = "triviadrop";
   public static final String COMMAND_NAME_UPDATE = "update";
   public static final String COMMAND_NAME_WALLET = "wallet";
   //
@@ -40,6 +41,22 @@ public class Constants {
   public static final int maximumTransferParts = 5;
   public static final int maximumTransferAttepts = 3;
   public static final int maximumDropUsers = 10000;
+  //
+  /** Trivia drops are short by design: a long window is a Google window. */
+  public static final int defaultTriviaDropDuration = 3;
+  /** A question used within this many days is passed over while others remain. */
+  public static final int triviaRecentlyUsedDays = 7;
+  /** Discord caps a button label at 80 characters; answers live on buttons. */
+  public static final int maximumTriviaAnswerLength = 80;
+  public static final int maximumTriviaQuestionLength = 1000;
+  /** One action row holds at most five buttons; four answers is the format. */
+  public static final int maximumTriviaAnswers = 4;
+  /** The difficulty values a question may carry and a /triviadrop may ask for. */
+  public static final java.util.List<String> TRIVIA_DIFFICULTIES =
+    java.util.List.of("easy", "medium", "hard");
+  /** Seconds leftover on a trivia drop. The 10-second floor applies only when minutes is 0. */
+  public static final int minimumTriviaSeconds = 10;
+  public static final int maximumTriviaSeconds = 59;
   /** Scale for converting USD amounts into crypto units (matches max fractional digits on $ input). */
   public static final int dollarToCryptoDecimalPlaces = 8;
   //
@@ -50,4 +67,11 @@ public class Constants {
   public static final String PROTOCOL_NANO = "NANO";
   public static final String PROTOCOL_MONERO = "MONERO";
   public static final String PROTOCOL_BITCOIN = "BITCOIN";
+  //
+  /**
+   * Stands in for a ticker on a fishing request to mean "no preference". Sent
+   * when the user picks the "Any" currency choice, which clears whatever default
+   * they had saved for the guild.
+   */
+  public static final String TICKER_ANY = "ANY";
 }

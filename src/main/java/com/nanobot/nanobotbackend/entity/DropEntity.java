@@ -2,6 +2,7 @@ package com.nanobot.nanobotbackend.entity;
 
 import com.nanobot.nanobotbackend.dto.DropDto;
 import com.nanobot.nanobotbackend.dto.TransferDto;
+import com.nanobot.nanobotbackend.dto.TriviaQuestionDto;
 import java.util.Date;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
@@ -13,6 +14,9 @@ public class DropEntity extends BaseEntity {
   private String channelId;
 
   private Integer duration;
+
+  /** Leftover seconds on a trivia drop; null on plain drops and on whole minutes. */
+  private Integer seconds;
 
   private Date endTime;
 
@@ -41,6 +45,12 @@ public class DropEntity extends BaseEntity {
 
   private String requiredRole;
 
+  /**
+   * Present only on trivia drops. Its answers are shown as buttons and only
+   * pickups that chose the correct index can win.
+   */
+  private TriviaQuestionDto trivia;
+
   public DropEntity() {
     super();
   }
@@ -49,6 +59,7 @@ public class DropEntity extends BaseEntity {
     super(drop.getId());
     this.channelId = drop.getChannelId();
     this.duration = drop.getDuration();
+    this.seconds = drop.getSeconds();
     this.endTime = drop.getEndTime();
     this.guildId = drop.getGuildId();
     this.input = drop.getInput();
@@ -61,6 +72,23 @@ public class DropEntity extends BaseEntity {
     this.transfer = drop.getTransfer();
     this.userId = drop.getUserId();
     this.username = drop.getUsername();
+    this.trivia = drop.getTrivia();
+  }
+
+  /**
+   * True for a trivia drop, which pays only correct answers. Named has* rather
+   * than is* so Jackson does not take it for a second "trivia" property.
+   */
+  public boolean hasTrivia() {
+    return trivia != null;
+  }
+
+  public TriviaQuestionDto getTrivia() {
+    return trivia;
+  }
+
+  public void setTrivia(TriviaQuestionDto trivia) {
+    this.trivia = trivia;
   }
 
   public String getChannelId() {
@@ -77,6 +105,14 @@ public class DropEntity extends BaseEntity {
 
   public void setDuration(Integer duration) {
     this.duration = duration;
+  }
+
+  public Integer getSeconds() {
+    return seconds;
+  }
+
+  public void setSeconds(Integer seconds) {
+    this.seconds = seconds;
   }
 
   public Date getEndTime() {

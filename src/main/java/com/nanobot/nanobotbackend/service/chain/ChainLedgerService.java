@@ -24,6 +24,68 @@ public interface ChainLedgerService {
     Map<String, String> commandMap
   );
 
+  /**
+   * Same as {@link #creditDeposit(CurrencyEntity, String, String, String,
+   * String, Map)}, but with {@code notify} false the ledger is credited and no
+   * message is written. The caller then owes a {@link #notifyDepositConfirmed}
+   * once whatever it needs to say first has been said. Used when a deposit is
+   * the far end of one of our own withdrawals, so the withdrawal can be
+   * announced before the deposit it caused.
+   */
+  String creditDeposit(
+    CurrencyEntity currencyEntity,
+    String userId,
+    String raw,
+    String txid,
+    String depositAddress,
+    Map<String, String> commandMap,
+    boolean notify
+  );
+
+  /** Tells a user their deposit has been credited. */
+  void notifyDepositConfirmed(
+    CurrencyEntity currencyEntity,
+    String userId,
+    String raw,
+    String txid,
+    String depositAddress,
+    String transactionId,
+    Map<String, String> commandMap
+  );
+
+  /**
+   * Tells a user an incoming transaction to their deposit address has been
+   * seen, but has not yet reached the confirmations needed to be credited.
+   * Deduplication is the caller's job; this writes a message every time.
+   *
+   * @param confirmations how many the transaction has so far
+   * @param required how many it needs before it is credited
+   */
+  void notifyDepositDiscovered(
+    CurrencyEntity currencyEntity,
+    String userId,
+    String raw,
+    String txid,
+    String depositAddress,
+    long confirmations,
+    int required,
+    Map<String, String> commandMap
+  );
+
+  /**
+   * Tells a user their withdrawal has been broadcast and is waiting on the
+   * network, so a slow chain does not look like a lost /send.
+   *
+   * @param required confirmations the chain needs before it is announced as
+   *     confirmed
+   */
+  void notifyWithdrawalSent(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    int required,
+    Map<String, String> commandMap
+  );
+
   /** Notifies a user that their withdrawal reached the required confirmations. */
   void notifyWithdrawalConfirmed(
     CurrencyEntity currencyEntity,
