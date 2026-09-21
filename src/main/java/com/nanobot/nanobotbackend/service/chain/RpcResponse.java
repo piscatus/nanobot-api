@@ -44,4 +44,17 @@ public record RpcResponse(
   public boolean isTransportFailure() {
     return result == null && !refused;
   }
+
+  /**
+   * A non-blank string field from a successful result, or null. Callers use
+   * this for identifiers such as tx_hash, where an empty string is as useless
+   * as a missing field.
+   */
+  public String resultString(String key) {
+    if (result == null || key == null || !result.has(key)) {
+      return null;
+    }
+    String value = result.optString(key, "");
+    return value.isBlank() ? null : value;
+  }
 }

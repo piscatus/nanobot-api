@@ -311,9 +311,7 @@ class MoneroChainAdapterTest {
   void quoteShouldRejectAFeeLargerThanTheAmountWithTheMinimum() {
     when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
       .thenReturn(RpcResponse.refused(-16, "Transaction not possible"));
-    when(currenciesService.getEffectiveMinimumWithdraw(any()))
-      .thenReturn("60000001");
-    when(currenciesService.getCurrencyDecimalValue("60000001", 12))
+    when(currenciesService.formatEffectiveMinimumWithdraw(currency))
       .thenReturn("0.000060000001");
 
     FeeQuote quote = adapter.quoteWithdrawalFee(currency, "1000", "4abc");
@@ -326,6 +324,17 @@ class MoneroChainAdapterTest {
     String message = quote.refusal().confirmationMessage();
     assertTrue(message.contains("Nothing has been debited"));
     assertTrue(message.contains("0.000060000001 XMR"));
+  }
+
+  @Test
+  void quoteShouldTreatAZeroFeeAsUnavailable() throws Exception {
+    when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
+      .thenReturn(RpcResponse.success(new JSONObject().put("fee", 0L)));
+
+    assertEquals(
+      FeeQuote.Status.UNAVAILABLE,
+      adapter.quoteWithdrawalFee(currency, "1000000000", "4abc").status()
+    );
   }
 
   // --------------------------------------------------------------- deferral
@@ -437,6 +446,40 @@ class MoneroChainAdapterTest {
       .notifyWithdrawalDelayed(any(), any(), anyString(), any());
     verify(chainLedgerService, never())
       .refundFailedWithdrawal(any(), any(), anyString(), any());
+  }
+
+  @Test
+  void aSuccessfulTransferWithoutATxHashShouldNotCountAnAttempt()
+    throws Exception {
+    daemonAt(100L);
+    when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
+      .thenReturn(RpcResponse.success(new JSONObject().put("fee", 30700000L)));
+
+    pass();
+
+    assertNull(queue.getAttempts());
+    assertNull(queue.getBlockHash());
+    assertFalse(queue.getProcessed());
+    verify(queuesService, never())
+      .updateQueueProgress(eq("q1"), eq(1), any(), any(), any());
+    verify(chainLedgerService, never())
+      .refundFailedWithdrawal(any(), any(), anyString(), any());
+  }
+
+  @Test
+  void aBlankTxHashShouldNotMarkTheQueueProcessed() throws Exception {
+    daemonAt(100L);
+    when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
+      .thenReturn(
+        RpcResponse.success(new JSONObject().put("tx_hash", "").put("fee", 1L))
+      );
+
+    pass();
+
+    assertNull(queue.getBlockHash());
+    assertFalse(queue.getProcessed());
+    verify(chainLedgerService, never())
+      .notifyWithdrawalSent(any(), any(), anyInt(), any());
   }
 
   @Test

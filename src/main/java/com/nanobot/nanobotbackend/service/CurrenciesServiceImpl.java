@@ -158,6 +158,17 @@ public class CurrenciesServiceImpl implements CurrenciesService {
   }
 
   @Override
+  public String formatEffectiveMinimumWithdraw(CurrencyEntity currency) {
+    if (currency == null) {
+      return null;
+    }
+    return getCurrencyDecimalValue(
+      getEffectiveMinimumWithdraw(new CurrencyDto(currency)),
+      Integer.parseInt(currency.getPrecision())
+    );
+  }
+
+  @Override
   public Optional<CurrencyEntity> createCurrency(CurrencyDto currencyDto) {
     CurrencyEntity currencyEntity = new CurrencyEntity(currencyDto);
     ObjectId id = new ObjectId();

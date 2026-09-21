@@ -35,6 +35,26 @@ public record WalletRefusal(Kind kind, String reason, String hint) {
     this(kind, reason, null);
   }
 
+  /**
+   * The fee taken out of the output would leave nothing to send. The hint
+   * names the current floor so the user knows what would succeed.
+   */
+  public static WalletRefusal feeExceedsAmount(
+    String formattedMinimum,
+    String ticker
+  ) {
+    return new WalletRefusal(
+      Kind.FEE_EXCEEDS_AMOUNT,
+      "The network fee would exceed the amount requested, so the " +
+      "transaction could not be created.",
+      "The current minimum withdrawal, including network fees, is **" +
+      formattedMinimum +
+      " " +
+      ticker +
+      "**."
+    );
+  }
+
   /** Whether waiting can change the outcome. */
   public boolean isTransient() {
     return kind == Kind.FUNDS_LOCKED || kind == Kind.UNREACHABLE;

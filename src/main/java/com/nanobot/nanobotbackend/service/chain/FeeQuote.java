@@ -31,4 +31,12 @@ public record FeeQuote(Status status, BigInteger fee, WalletRefusal refusal) {
   public static FeeQuote unavailable() {
     return new FeeQuote(Status.UNAVAILABLE, null, null);
   }
+
+  /** A quoted fee of zero is not a real quote; treat it as unavailable. */
+  public static FeeQuote ofFee(BigInteger fee) {
+    if (fee == null || fee.signum() <= 0) {
+      return unavailable();
+    }
+    return quoted(fee);
+  }
 }

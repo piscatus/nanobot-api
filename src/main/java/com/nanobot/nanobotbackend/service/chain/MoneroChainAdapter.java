@@ -1,6 +1,5 @@
 package com.nanobot.nanobotbackend.service.chain;
 
-import com.nanobot.nanobotbackend.dto.CurrencyDto;
 import com.nanobot.nanobotbackend.dto.LevelDto;
 import com.nanobot.nanobotbackend.dto.QueueDto;
 import com.nanobot.nanobotbackend.entity.CurrencyEntity;
@@ -221,21 +220,21 @@ public class MoneroChainAdapter implements ChainAdapter {
     RpcResponse response = rpc.walletDetailed(currencyEntity, "transfer", params);
     if (response.isSuccess()) {
       long fee = response.result().optLong("fee", -1L);
-      if (fee < 0L) {
-        return FeeQuote.unavailable();
+      FeeQuote quote = FeeQuote.ofFee(BigInteger.valueOf(fee));
+      if (quote.status() == FeeQuote.Status.QUOTED) {
+        fileLogger.info(
+          "Quoted " +
+          currencyEntity.getTicker() +
+          " withdrawal of " +
+          raw +
+          ": fee " +
+          fee +
+          " (weight " +
+          response.result().optLong("weight", 0L) +
+          ")"
+        );
       }
-      fileLogger.info(
-        "Quoted " +
-        currencyEntity.getTicker() +
-        " withdrawal of " +
-        raw +
-        ": fee " +
-        fee +
-        " (weight " +
-        response.result().optLong("weight", 0L) +
-        ")"
-      );
-      return FeeQuote.quoted(BigInteger.valueOf(fee));
+      return quote;
     }
 
     WalletRefusal refusal = classifyRefusal(currencyEntity, response);
@@ -288,15 +287,9 @@ public class MoneroChainAdapter implements ChainAdapter {
       : classifyCode(response.errorCode(), response.errorMessage());
     String name = currencyEntity.getName();
     return switch (kind) {
-      case FEE_EXCEEDS_AMOUNT -> new WalletRefusal(
-        kind,
-        "The network fee would exceed the amount requested, so the " +
-        "transaction could not be created.",
-        "The current minimum withdrawal, including network fees, is **" +
-        effectiveMinimum(currencyEntity) +
-        " " +
-        currencyEntity.getTicker() +
-        "**."
+      case FEE_EXCEEDS_AMOUNT -> WalletRefusal.feeExceedsAmount(
+        currenciesService.formatEffectiveMinimumWithdraw(currencyEntity),
+        currencyEntity.getTicker()
       );
       case FUNDS_LOCKED -> new WalletRefusal(
         kind,
@@ -374,15 +367,6 @@ public class MoneroChainAdapter implements ChainAdapter {
       return WalletRefusal.Kind.UNREACHABLE;
     }
     return WalletRefusal.Kind.OTHER;
-  }
-
-  private String effectiveMinimum(CurrencyEntity currencyEntity) {
-    return currenciesService.getCurrencyDecimalValue(
-      currenciesService.getEffectiveMinimumWithdraw(
-        new CurrencyDto(currencyEntity)
-      ),
-      Integer.parseInt(currencyEntity.getPrecision())
-    );
   }
 
   /**
@@ -1097,17 +1081,43 @@ public class MoneroChainAdapter implements ChainAdapter {
       );
     }
 
-    RpcResponse response = rpc.walletDetailed(
-      currencyEntity,
-      "transfer",
-      buildTransferParams(
+    JSONObject params;
+    try {
+      params = buildTransferParams(
         currencyEntity,
         queueEntity.getRaw(),
         queueEntity.getTargetAddress()
-      )
+      );
+    } catch (RuntimeException e) {
+      fileLogger.error(
+        "Could not build a " +
+        currencyEntity.getTicker() +
+        " transfer for queue #" +
+        queueEntity.getId() +
+        ": " +
+        e.getMessage()
+      );
+      handleSendFailure(
+        queueEntity,
+        currencyEntity,
+        new WalletRefusal(
+          WalletRefusal.Kind.OTHER,
+          "The bot's " +
+          currencyEntity.getName() +
+          " wallet could not create this transaction."
+        ),
+        commandMap
+      );
+      return;
+    }
+
+    RpcResponse response = rpc.walletDetailed(
+      currencyEntity,
+      "transfer",
+      params
     );
 
-    if (!response.isSuccess() || !response.result().has(TX_HASH_KEY)) {
+    if (!response.isSuccess()) {
       WalletRefusal refusal = classifyRefusal(currencyEntity, response);
       switch (refusal.kind()) {
         case UNREACHABLE -> fileLogger.warn(
@@ -1136,9 +1146,22 @@ public class MoneroChainAdapter implements ChainAdapter {
       return;
     }
 
+    String txHash = response.resultString(TX_HASH_KEY);
+    if (txHash == null) {
+      // The wallet answered but gave nothing to record. Counting that as a
+      // refusal would burn attempts on a malformed success; wait and retry.
+      fileLogger.warn(
+        currencyEntity.getTicker() +
+        " wallet accepted the transfer for queue #" +
+        queueEntity.getId() +
+        " but returned no tx_hash; will retry."
+      );
+      return;
+    }
+
     JSONObject result = response.result();
     clearDeferral(queueEntity.getId());
-    queueEntity.setBlockHash(result.getString(TX_HASH_KEY));
+    queueEntity.setBlockHash(txHash);
     queueEntity.setProcessed(true);
     queuesService.updateQueueProgress(
       queueEntity.getId(),

@@ -70,4 +70,10 @@ public interface CurrenciesService {
    * minimumWithdraw.
    */
   String getEffectiveMinimumWithdraw(CurrencyDto currency);
+
+  /**
+   * {@link #getEffectiveMinimumWithdraw} formatted in the currency's display
+   * units, for user-facing copy.
+   */
+  String formatEffectiveMinimumWithdraw(CurrencyEntity currency);
 }

@@ -1,6 +1,5 @@
 package com.nanobot.nanobotbackend.service.chain;
 
-import com.nanobot.nanobotbackend.dto.CurrencyDto;
 import com.nanobot.nanobotbackend.dto.LevelDto;
 import com.nanobot.nanobotbackend.dto.QueueDto;
 import com.nanobot.nanobotbackend.entity.CurrencyEntity;
@@ -232,18 +231,18 @@ public class BitcoinChainAdapter implements ChainAdapter {
 
     if (response.isSuccess()) {
       BigInteger fee = toSatoshis(response.result().opt("fee"));
-      if (fee == null || fee.signum() <= 0) {
-        return FeeQuote.unavailable();
+      FeeQuote quote = FeeQuote.ofFee(fee);
+      if (quote.status() == FeeQuote.Status.QUOTED) {
+        fileLogger.info(
+          "Quoted " +
+          currencyEntity.getTicker() +
+          " withdrawal of " +
+          raw +
+          ": fee " +
+          fee
+        );
       }
-      fileLogger.info(
-        "Quoted " +
-        currencyEntity.getTicker() +
-        " withdrawal of " +
-        raw +
-        ": fee " +
-        fee
-      );
-      return FeeQuote.quoted(fee);
+      return quote;
     }
 
     WalletRefusal refusal = classifyRefusal(currencyEntity, response);
@@ -271,15 +270,9 @@ public class BitcoinChainAdapter implements ChainAdapter {
       : classifyCode(response.errorCode(), response.errorMessage());
     String name = currencyEntity.getName();
     return switch (kind) {
-      case FEE_EXCEEDS_AMOUNT -> new WalletRefusal(
-        kind,
-        "The network fee would exceed the amount requested, so the " +
-        "transaction could not be created.",
-        "The current minimum withdrawal, including network fees, is **" +
-        effectiveMinimum(currencyEntity) +
-        " " +
-        currencyEntity.getTicker() +
-        "**."
+      case FEE_EXCEEDS_AMOUNT -> WalletRefusal.feeExceedsAmount(
+        currenciesService.formatEffectiveMinimumWithdraw(currencyEntity),
+        currencyEntity.getTicker()
       );
       case INSUFFICIENT_FUNDS -> new WalletRefusal(
         kind,
@@ -319,15 +312,6 @@ public class BitcoinChainAdapter implements ChainAdapter {
       return WalletRefusal.Kind.ADDRESS_REJECTED;
     }
     return WalletRefusal.Kind.OTHER;
-  }
-
-  private String effectiveMinimum(CurrencyEntity currencyEntity) {
-    return currenciesService.getCurrencyDecimalValue(
-      currenciesService.getEffectiveMinimumWithdraw(
-        new CurrencyDto(currencyEntity)
-      ),
-      Integer.parseInt(currencyEntity.getPrecision())
-    );
   }
 
   /**
@@ -941,10 +925,7 @@ public class BitcoinChainAdapter implements ChainAdapter {
       ESTIMATE_MODE
     );
 
-    String txid = response.isSuccess()
-      ? response.result().optString(BitcoinRpcClient.RESULT_KEY, null)
-      : null;
-    if (txid == null || txid.isBlank()) {
+    if (!response.isSuccess()) {
       WalletRefusal refusal = classifyRefusal(currencyEntity, response);
       if (refusal.kind() == WalletRefusal.Kind.UNREACHABLE) {
         // Not counted as an attempt: the send was never judged. The entry waits
@@ -960,6 +941,17 @@ public class BitcoinChainAdapter implements ChainAdapter {
         return;
       }
       handleSendFailure(queueEntity, currencyEntity, refusal, commandMap);
+      return;
+    }
+
+    String txid = response.resultString(BitcoinRpcClient.RESULT_KEY);
+    if (txid == null) {
+      fileLogger.warn(
+        currencyEntity.getTicker() +
+        " wallet accepted the send for queue #" +
+        queueEntity.getId() +
+        " but returned no txid; will retry."
+      );
       return;
     }
 

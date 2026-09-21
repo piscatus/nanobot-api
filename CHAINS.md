@@ -214,10 +214,11 @@ is in. Collapsing the last two is how a user gets paid twice.
 - On the /send preview pass the adapter asks the wallet to build the exact
   transaction without relaying it (Monero `transfer` with `do_not_relay`,
   Bitcoin `walletcreatefundedpsbt`). The quoted fee is what the confirmation
-  embed shows. A refusal that is not a wait (fee larger than the amount, not
-  enough funds, too many inputs, bad address) is returned before any debit. A
-  wait or an unreachable wallet leaves `networkFee` unset and the frontend
-  falls back to the estimate.
+  and receipt embeds show. A refusal that is not a wait (fee larger than the
+  amount, not enough funds, too many inputs, bad address) is returned before
+  any debit. A wait or an unreachable wallet leaves `networkFee` unset and the
+  frontend falls back to the estimate. `/currencies` and `/help` always show
+  the typical-size estimate: they have no destination or amount to quote.
 - A fee-bearing currency with no usable estimate refuses withdrawals rather than
   falling back to the bare minimum, which would accept an amount the fee will
   consume. `ChainAdapter.hasNetworkFee` decides this, so it is a property of the
