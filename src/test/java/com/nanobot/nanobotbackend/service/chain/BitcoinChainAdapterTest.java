@@ -5,6 +5,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -186,6 +187,80 @@ class BitcoinChainAdapterTest {
   }
 
   @Test
+  void quoteShouldNameTheLiveFeePlusDustWhenTheAmountIsTooSmall()
+    throws JSONException {
+    BitcoinRpcClient rpc = mock(BitcoinRpcClient.class);
+    CurrencyEntity currency = bitcoin();
+    CurrenciesService currenciesService = mock(CurrenciesService.class);
+    when(currenciesService.getCurrencyDecimalValue("435", 8))
+      .thenReturn("0.00000435");
+    BitcoinChainAdapter adapter = new BitcoinChainAdapter(
+      rpc,
+      currenciesService,
+      mock(DepositAddressService.class),
+      mock(DepositRecordsRepository.class),
+      mock(DepositNoticeService.class),
+      mock(QueuesService.class)
+    );
+    when(
+      rpc.walletDetailed(
+        eq(currency),
+        eq("walletcreatefundedpsbt"),
+        any(),
+        any(),
+        any(),
+        any()
+      )
+    )
+      .thenReturn(
+        RpcResponse.refused(
+          -4,
+          "The transaction amount is too small to send after the fee has been deducted"
+        )
+      )
+      .thenReturn(
+        RpcResponse.success(new JSONObject().put("fee", "0.00000141"))
+      );
+
+    FeeQuote quote = adapter.quoteWithdrawalFee(currency, "500", "bc1qaaa");
+
+    assertEquals(FeeQuote.Status.REJECTED, quote.status());
+    assertTrue(quote.refusal().hint().contains("0.00000435 BTC"));
+    verify(currenciesService, never()).formatEffectiveMinimumWithdraw(any());
+  }
+
+  @Test
+  void quoteShouldOmitAMinimumWhenTheLiveFeeCannotBeMeasured() {
+    BitcoinRpcClient rpc = mock(BitcoinRpcClient.class);
+    CurrencyEntity currency = bitcoin();
+    when(
+      rpc.walletDetailed(
+        eq(currency),
+        eq("walletcreatefundedpsbt"),
+        any(),
+        any(),
+        any(),
+        any()
+      )
+    )
+      .thenReturn(
+        RpcResponse.refused(
+          -4,
+          "The transaction amount is too small to send after the fee has been deducted"
+        )
+      );
+
+    FeeQuote quote = adapterWith(rpc).quoteWithdrawalFee(
+      currency,
+      "500",
+      "bc1qaaa"
+    );
+
+    assertEquals(FeeQuote.Status.REJECTED, quote.status());
+    assertNull(quote.refusal().hint());
+  }
+
+  @Test
   void quoteShouldTreatAnUnreachableNodeAsUnavailable() {
     BitcoinRpcClient rpc = mock(BitcoinRpcClient.class);
     CurrencyEntity currency = bitcoin();
@@ -258,6 +333,19 @@ class BitcoinChainAdapterTest {
       BigInteger.valueOf(100000000L),
       BitcoinChainAdapter.toSatoshis("1.0")
     );
+  }
+
+  @Test
+  void walletTxFeeShouldTakeTheAbsoluteValueOfANegativeGettransactionFee()
+    throws JSONException {
+    assertEquals(
+      BigInteger.valueOf(141L),
+      BitcoinChainAdapter.walletTxFee(
+        new JSONObject().put("fee", "-0.00000141")
+      )
+    );
+    assertNull(BitcoinChainAdapter.walletTxFee(null));
+    assertNull(BitcoinChainAdapter.walletTxFee(new JSONObject()));
   }
 
   /**

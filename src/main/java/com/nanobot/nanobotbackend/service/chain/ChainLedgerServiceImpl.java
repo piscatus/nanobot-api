@@ -13,6 +13,7 @@ import com.nanobot.nanobotbackend.service.TransactionsService;
 import com.nanobot.nanobotbackend.service.TransferExecutorService;
 import com.nanobot.nanobotbackend.task.FileLogger;
 import com.nanobot.nanobotbackend.util.Constants;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
@@ -313,7 +314,8 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
     CurrencyEntity currencyEntity,
     QueueEntity queueEntity,
     int required,
-    Map<String, String> commandMap
+    Map<String, String> commandMap,
+    BigInteger networkFee
   ) {
     if (queueEntity.getUserId() == null) {
       return;
@@ -344,7 +346,7 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
       ) +
       ") " +
       currencyEntity.getEmoji() +
-      feeNote(currencyEntity) +
+      feeNote(currencyEntity, queueEntity, networkFee) +
       "\n### 🔗 __" +
       hashLabel(currencyEntity) +
       "__\n> `" +
@@ -473,7 +475,8 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
   public void notifyWithdrawalConfirmed(
     CurrencyEntity currencyEntity,
     QueueEntity queueEntity,
-    Map<String, String> commandMap
+    Map<String, String> commandMap,
+    BigInteger networkFee
   ) {
     if (queueEntity.getUserId() == null) {
       return;
@@ -513,7 +516,7 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
       ) +
       ") " +
       currencyEntity.getEmoji() +
-      "\n-# The network fee was deducted from the amount sent." +
+      feeNote(currencyEntity, queueEntity, networkFee) +
       "\n### 🔗 __Transaction__\n> `" +
       queueEntity.getBlockHash() +
       "`\n### 📌 __Withdrawal Address__\n> `" +
@@ -706,12 +709,51 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
 
   /**
    * Nano is feeless, so the fee line the other chains carry would be a lie
-   * there.
+   * there. When the broadcast fee is known, name it and what arrived; otherwise
+   * keep the generic sentence so the notice still explains why the on-chain
+   * amount is smaller than the debit.
    */
-  private static String feeNote(CurrencyEntity currencyEntity) {
-    return isNano(currencyEntity)
-      ? ""
-      : "\n-# The network fee was deducted from the amount sent.";
+  private String feeNote(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    BigInteger networkFee
+  ) {
+    if (isNano(currencyEntity)) {
+      return "";
+    }
+    if (networkFee != null && networkFee.signum() > 0) {
+      int precision = Integer.parseInt(currencyEntity.getPrecision());
+      String ticker = currencyEntity.getTicker();
+      String formattedFee = currenciesService.getCurrencyDecimalValue(
+        networkFee.toString(),
+        precision
+      );
+      BigInteger received;
+      try {
+        received = new BigInteger(queueEntity.getRaw()).subtract(networkFee);
+      } catch (NumberFormatException e) {
+        received = BigInteger.ZERO;
+      }
+      if (received.signum() < 0) {
+        received = BigInteger.ZERO;
+      }
+      String formattedReceived = currenciesService.getCurrencyDecimalValue(
+        received.toString(),
+        precision
+      );
+      return (
+        "\n**The network fee was " +
+        formattedFee +
+        " " +
+        ticker +
+        ". The recipient received " +
+        formattedReceived +
+        " " +
+        ticker +
+        ".**"
+      );
+    }
+    return "\n-# The network fee was deducted from the amount sent.";
   }
 
   /**

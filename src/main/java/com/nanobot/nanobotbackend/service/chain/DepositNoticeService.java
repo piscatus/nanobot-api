@@ -57,11 +57,22 @@ public class DepositNoticeService {
           .on("addressIndex", Sort.Direction.ASC)
           .unique()
       );
+      Duration ttl = Duration.ofSeconds(DepositNoticeEntity.TTL_SECONDS);
+      boolean recreateTtl = indexOperations
+        .getIndexInfo()
+        .stream()
+        .filter(info -> "timestamp_ttl".equals(info.getName()))
+        .findFirst()
+        .map(info -> !ttl.equals(info.getExpireAfter().orElse(Duration.ZERO)))
+        .orElse(false);
+      if (recreateTtl) {
+        indexOperations.dropIndex("timestamp_ttl");
+      }
       indexOperations.ensureIndex(
         new Index()
           .named("timestamp_ttl")
           .on("timestamp", Sort.Direction.ASC)
-          .expire(Duration.ofSeconds(DepositNoticeEntity.TTL_SECONDS))
+          .expire(ttl)
       );
     } catch (RuntimeException e) {
       // Startup must not depend on Mongo being reachable at this exact moment;

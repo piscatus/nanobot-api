@@ -111,8 +111,13 @@ transaction on every scan costs nothing. It is a separate collection from
 `depositRecords` on purpose: a row there means money moved, and the credit paths
 must never have to ask which kind of row they are looking at. A deposit that
 already has a record is never announced as discovered, since a "discovered"
-after a "confirmed" would read as a second deposit. Notice rows expire after a
-week.
+after a "confirmed" would read as a second deposit. Notice rows expire after
+fourteen days, matching Bitcoin Core's default mempool expiry.
+
+**Later:** if a discovered Bitcoin deposit is replaced (RBF / conflicted
+`confirmations < 0`), send one follow-up that the earlier transaction will
+not confirm and that the replacement is the one being watched. Not needed
+while volume is low; the replacement already gets its own discovery notice.
 
 ## Exactly-Once Crediting
 
@@ -214,7 +219,9 @@ is in. Collapsing the last two is how a user gets paid twice.
 - On the /send preview pass the adapter asks the wallet to build the exact
   transaction without relaying it (Monero `transfer` with `do_not_relay`,
   Bitcoin `walletcreatefundedpsbt`). The quoted fee is what the confirmation
-  and receipt embeds show. A refusal that is not a wait (fee larger than the
+  and receipt embeds show. Sent and confirmed notices name the fee the wallet
+  actually took and what the recipient received, when that figure is known.
+  A refusal that is not a wait (fee larger than the
   amount, not enough funds, too many inputs, bad address) is returned before
   any debit. A wait or an unreachable wallet leaves `networkFee` unset and the
   frontend falls back to the estimate. `/currencies` and `/help` always show
@@ -255,7 +262,7 @@ is in. Collapsing the last two is how a user gets paid twice.
 | `queues` | in-flight sends, receives and representative updates |
 | `depositAddresses` | address to user mapping for hot-wallet protocols |
 | `depositRecords` | permanent record of credited deposits; the double-credit guard |
-| `depositNotices` | deposits already announced as discovered; expires after a week |
+| `depositNotices` | deposits already announced as discovered; expires after 14 days |
 | `currencies` | per-currency configuration and chain cursor state |
 
 ## Currency Configuration

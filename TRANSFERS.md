@@ -64,6 +64,14 @@ This document describes the expected transfer behavior for backend execution in 
 5. Persist allowed entities (excluding `"0"` and `BOT_USER_ID` in user collections).
 6. Persist transaction record.
 
+`executeTransfer` retries the whole unit three times on
+`OptimisticLockingFailureException` (concurrent wallet writes). That already
+covers the Mongo write collisions that show up in production, including
+deposit mints. **Later:** tighten that retry so a failed persist cannot leave
+a half-applied transfer (for example a `depositRecords` row with no ledger
+credit). Do not special-case deposits; improve the shared transactional
+retry.
+
 ## Backend vs Frontend Validation
 
 - Frontend command checks (for example, fish reserve prechecks) are useful UX guards.

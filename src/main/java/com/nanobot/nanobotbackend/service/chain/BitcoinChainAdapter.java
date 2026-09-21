@@ -245,7 +245,12 @@ public class BitcoinChainAdapter implements ChainAdapter {
       return quote;
     }
 
-    WalletRefusal refusal = classifyRefusal(currencyEntity, response);
+    WalletRefusal refusal = classifyRefusal(
+      currencyEntity,
+      response,
+      raw,
+      address
+    );
     if (refusal.isTransient()) {
       return FeeQuote.unavailable();
     }
@@ -263,17 +268,16 @@ public class BitcoinChainAdapter implements ChainAdapter {
    */
   WalletRefusal classifyRefusal(
     CurrencyEntity currencyEntity,
-    RpcResponse response
+    RpcResponse response,
+    String raw,
+    String address
   ) {
     WalletRefusal.Kind kind = response.isTransportFailure()
       ? WalletRefusal.Kind.UNREACHABLE
       : classifyCode(response.errorCode(), response.errorMessage());
     String name = currencyEntity.getName();
     return switch (kind) {
-      case FEE_EXCEEDS_AMOUNT -> WalletRefusal.feeExceedsAmount(
-        currenciesService.formatEffectiveMinimumWithdraw(currencyEntity),
-        currencyEntity.getTicker()
-      );
+      case FEE_EXCEEDS_AMOUNT -> feeExceedsRefusal(currencyEntity, raw, address);
       case INSUFFICIENT_FUNDS -> new WalletRefusal(
         kind,
         "The bot's " +
@@ -295,6 +299,84 @@ public class BitcoinChainAdapter implements ChainAdapter {
         "The bot's " + name + " wallet could not create this transaction."
       );
     };
+  }
+
+  /**
+   * P2WPKH dust: Bitcoin Core will not relay a smaller output. A withdrawal
+   * that subtracts the fee must therefore clear the fee plus this floor.
+   */
+  static final BigInteger P2WPKH_DUST = BigInteger.valueOf(294L);
+
+  /**
+   * Names a live floor when the wallet will say what this destination would
+   * cost with the fee added on top. Falls back to the reason without a number
+   * rather than quoting {@code feeEstimate}, which is a typical-size guess and
+   * can be below the fee that actually failed.
+   */
+  WalletRefusal feeExceedsRefusal(
+    CurrencyEntity currencyEntity,
+    String raw,
+    String address
+  ) {
+    String formatted = liveMinimumWithdraw(currencyEntity, raw, address);
+    if (formatted == null) {
+      return WalletRefusal.feeExceedsAmount();
+    }
+    return WalletRefusal.feeExceedsAmount(
+      formatted,
+      currencyEntity.getTicker()
+    );
+  }
+
+  /**
+   * Asks for the same coin selection without subtracting the fee, so the
+   * wallet still reports a fee for an amount it just refused to send net.
+   */
+  String liveMinimumWithdraw(
+    CurrencyEntity currencyEntity,
+    String raw,
+    String address
+  ) {
+    if (raw == null || address == null || address.isBlank()) {
+      return null;
+    }
+    BigInteger satoshis;
+    try {
+      satoshis = new BigInteger(raw);
+    } catch (NumberFormatException e) {
+      return null;
+    }
+    if (satoshis.signum() <= 0) {
+      return null;
+    }
+
+    JSONArray outputs = new JSONArray()
+      .put(new JSONObject().put(address, toBitcoin(satoshis)));
+    JSONObject options = new JSONObject()
+      .put("conf_target", resolveConfirmationTarget(currencyEntity))
+      .put("estimate_mode", ESTIMATE_MODE)
+      .put("replaceable", false);
+
+    RpcResponse response = rpc.walletDetailed(
+      currencyEntity,
+      "walletcreatefundedpsbt",
+      new JSONArray(),
+      outputs,
+      0,
+      options
+    );
+    if (!response.isSuccess()) {
+      return null;
+    }
+    BigInteger fee = toSatoshis(response.result().opt("fee"));
+    if (fee == null || fee.signum() <= 0) {
+      return null;
+    }
+    BigInteger minimum = fee.add(P2WPKH_DUST);
+    return currenciesService.getCurrencyDecimalValue(
+      minimum.toString(),
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
   }
 
   static WalletRefusal.Kind classifyCode(Integer code, String message) {
@@ -926,7 +1008,12 @@ public class BitcoinChainAdapter implements ChainAdapter {
     );
 
     if (!response.isSuccess()) {
-      WalletRefusal refusal = classifyRefusal(currencyEntity, response);
+      WalletRefusal refusal = classifyRefusal(
+        currencyEntity,
+        response,
+        queueEntity.getRaw(),
+        queueEntity.getTargetAddress()
+      );
       if (refusal.kind() == WalletRefusal.Kind.UNREACHABLE) {
         // Not counted as an attempt: the send was never judged. The entry waits
         // for the node to come back, as a brief outage must not cancel a good
@@ -981,7 +1068,10 @@ public class BitcoinChainAdapter implements ChainAdapter {
       currencyEntity,
       queueEntity,
       ChainSettings.confirmations(currencyEntity, DEFAULT_CONFIRMATIONS),
-      commandMap
+      commandMap,
+      walletTxFee(
+        rpc.wallet(currencyEntity, "gettransaction", txid)
+      )
     );
   }
 
@@ -1039,7 +1129,8 @@ public class BitcoinChainAdapter implements ChainAdapter {
       chainLedgerService.notifyWithdrawalConfirmed(
         currencyEntity,
         queueEntity,
-        commandMap
+        commandMap,
+        walletTxFee(transaction)
       );
     }
   }
@@ -1422,6 +1513,21 @@ public class BitcoinChainAdapter implements ChainAdapter {
       // keeps it from being considered as a deposit at all.
       false
     );
+  }
+
+  /**
+   * {@code gettransaction} reports the fee as a negative BTC amount. The
+   * notices want a positive integer in satoshis.
+   */
+  static BigInteger walletTxFee(JSONObject transaction) {
+    if (transaction == null) {
+      return null;
+    }
+    BigInteger fee = toSatoshis(transaction.opt("fee"));
+    if (fee == null || fee.signum() == 0) {
+      return null;
+    }
+    return fee.abs();
   }
 
   /**

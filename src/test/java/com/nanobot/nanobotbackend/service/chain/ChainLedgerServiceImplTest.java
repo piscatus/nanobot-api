@@ -275,6 +275,35 @@ class ChainLedgerServiceImplTest {
     assertTrue(userMessage.getContent().contains("**10 confirmations**"));
   }
 
+  @Test
+  void withdrawalSentNoticeShouldNameTheBroadcastFeeWhenKnown() {
+    when(currenciesService.getCurrencyDecimalValue("71860000", 12))
+      .thenReturn("0.00007186");
+    when(currenciesService.getCurrencyDecimalValue("1499928140000", 12))
+      .thenReturn("1.49992814");
+
+    service.notifyWithdrawalSent(
+      currency(Constants.PROTOCOL_MONERO),
+      queue("user"),
+      10,
+      commandMap,
+      new java.math.BigInteger("71860000")
+    );
+
+    MessageDto userMessage = capturedMessages().get(1);
+    assertTrue(
+      userMessage.getContent().contains("The network fee was 0.00007186 XMR")
+    );
+    assertTrue(
+      userMessage
+        .getContent()
+        .contains("The recipient received 1.49992814 XMR")
+    );
+    assertFalse(
+      userMessage.getContent().contains("The network fee was deducted")
+    );
+  }
+
   /**
    * Nano is feeless and has blocks rather than transactions, so its notice must
    * not claim a fee was taken and should keep the wording the Nano path already

@@ -402,7 +402,7 @@ class MoneroChainAdapterTest {
     assertTrue(queue.getProcessed());
     assertNull(queue.getAttempts());
     verify(chainLedgerService)
-      .notifyWithdrawalSent(eq(currency), eq(queue), anyInt(), any());
+      .notifyWithdrawalSent(eq(currency), eq(queue), anyInt(), any(), any());
   }
 
   /**
@@ -479,7 +479,7 @@ class MoneroChainAdapterTest {
     assertNull(queue.getBlockHash());
     assertFalse(queue.getProcessed());
     verify(chainLedgerService, never())
-      .notifyWithdrawalSent(any(), any(), anyInt(), any());
+      .notifyWithdrawalSent(any(), any(), anyInt(), any(), any());
   }
 
   @Test

@@ -23,7 +23,9 @@ import org.springframework.data.mongodb.core.mapping.Document;
  * <p>Rows expire after {@link #TTL_SECONDS}. Once a deposit has been credited
  * it never again appears with too few confirmations, so the notice has nothing
  * left to guard against, and letting Mongo drop it keeps the collection from
- * growing forever.
+ * growing forever. Fourteen days matches Bitcoin Core's default mempool
+ * expiry, so a stuck 0-conf cannot be announced a second time while the
+ * network still holds it.
  */
 @Document(collection = "depositNotices")
 @CompoundIndex(
@@ -33,8 +35,8 @@ import org.springframework.data.mongodb.core.mapping.Document;
 )
 public class DepositNoticeEntity extends BaseEntity {
 
-  /** Seven days: far longer than any deposit takes to confirm or be dropped. */
-  public static final int TTL_SECONDS = 7 * 24 * 60 * 60;
+  /** Fourteen days: Bitcoin Core drops unconfirmed transactions at this age. */
+  public static final int TTL_SECONDS = 14 * 24 * 60 * 60;
 
   private String ticker;
 
@@ -46,7 +48,7 @@ public class DepositNoticeEntity extends BaseEntity {
 
   private String raw;
 
-  @Indexed(name = "timestamp_ttl", expireAfter = "7d")
+  @Indexed(name = "timestamp_ttl", expireAfter = "14d")
   private Date timestamp;
 
   public DepositNoticeEntity() {

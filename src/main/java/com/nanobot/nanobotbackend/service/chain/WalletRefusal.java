@@ -45,15 +45,25 @@ public record WalletRefusal(Kind kind, String reason, String hint) {
   ) {
     return new WalletRefusal(
       Kind.FEE_EXCEEDS_AMOUNT,
-      "The network fee would exceed the amount requested, so the " +
-      "transaction could not be created.",
-      "The current minimum withdrawal, including network fees, is **" +
-      formattedMinimum +
-      " " +
-      ticker +
-      "**."
+      FEE_EXCEEDS_REASON,
+      formattedMinimum == null || formattedMinimum.isBlank()
+        ? null
+        : "The current minimum withdrawal, including network fees, is **" +
+        formattedMinimum +
+        " " +
+        ticker +
+        "**."
     );
   }
+
+  /** Same refusal without naming a floor that has not actually been measured. */
+  public static WalletRefusal feeExceedsAmount() {
+    return new WalletRefusal(Kind.FEE_EXCEEDS_AMOUNT, FEE_EXCEEDS_REASON);
+  }
+
+  private static final String FEE_EXCEEDS_REASON =
+    "The network fee would exceed the amount requested, so the " +
+    "transaction could not be created.";
 
   /** Whether waiting can change the outcome. */
   public boolean isTransient() {

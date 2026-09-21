@@ -2,6 +2,7 @@ package com.nanobot.nanobotbackend.service.chain;
 
 import com.nanobot.nanobotbackend.entity.CurrencyEntity;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
+import java.math.BigInteger;
 import java.util.Map;
 
 /**
@@ -78,13 +79,31 @@ public interface ChainLedgerService {
    *
    * @param required confirmations the chain needs before it is announced as
    *     confirmed
+   * @param networkFee the fee actually taken out of the output, or null when
+   *     it is unknown or the chain is feeless
    */
   void notifyWithdrawalSent(
     CurrencyEntity currencyEntity,
     QueueEntity queueEntity,
     int required,
-    Map<String, String> commandMap
+    Map<String, String> commandMap,
+    BigInteger networkFee
   );
+
+  default void notifyWithdrawalSent(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    int required,
+    Map<String, String> commandMap
+  ) {
+    notifyWithdrawalSent(
+      currencyEntity,
+      queueEntity,
+      required,
+      commandMap,
+      null
+    );
+  }
 
   /**
    * Tells a user their withdrawal is queued and waiting on the hot wallet
@@ -105,8 +124,17 @@ public interface ChainLedgerService {
   void notifyWithdrawalConfirmed(
     CurrencyEntity currencyEntity,
     QueueEntity queueEntity,
-    Map<String, String> commandMap
+    Map<String, String> commandMap,
+    BigInteger networkFee
   );
+
+  default void notifyWithdrawalConfirmed(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    Map<String, String> commandMap
+  ) {
+    notifyWithdrawalConfirmed(currencyEntity, queueEntity, commandMap, null);
+  }
 
   /**
    * Credits a failed withdrawal back to the user and tells them why.

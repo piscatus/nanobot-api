@@ -1188,7 +1188,8 @@ public class MoneroChainAdapter implements ChainAdapter {
       currencyEntity,
       queueEntity,
       ChainSettings.confirmations(currencyEntity, DEFAULT_CONFIRMATIONS),
-      commandMap
+      commandMap,
+      broadcastFee(result)
     );
   }
 
@@ -1511,6 +1512,14 @@ public class MoneroChainAdapter implements ChainAdapter {
     );
   }
 
+  static BigInteger broadcastFee(JSONObject transfer) {
+    if (transfer == null) {
+      return null;
+    }
+    long fee = transfer.optLong("fee", 0L);
+    return fee > 0L ? BigInteger.valueOf(fee) : null;
+  }
+
   private void confirmSend(
     QueueEntity queueEntity,
     CurrencyEntity currencyEntity,
@@ -1562,7 +1571,8 @@ public class MoneroChainAdapter implements ChainAdapter {
       chainLedgerService.notifyWithdrawalConfirmed(
         currencyEntity,
         queueEntity,
-        commandMap
+        commandMap,
+        broadcastFee(transfer)
       );
     }
 
