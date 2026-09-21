@@ -40,6 +40,13 @@ public class TransferResponseDto extends BaseResponseDto {
 
   private String input;
 
+  /**
+   * Exact network fee the hot wallet quoted for this withdrawal, in raw units,
+   * set on the confirmation pass of /send. Null when no quote was available, in
+   * which case the frontend shows the currency's estimate instead.
+   */
+  private String networkFee;
+
   /** The user's default fishing currency after this request, or null for any. */
   private String defaultTicker;
 
@@ -202,6 +209,14 @@ public class TransferResponseDto extends BaseResponseDto {
 
   public void setInput(String input) {
     this.input = input;
+  }
+
+  public String getNetworkFee() {
+    return networkFee;
+  }
+
+  public void setNetworkFee(String networkFee) {
+    this.networkFee = networkFee;
   }
 
   public String getDefaultTicker() {

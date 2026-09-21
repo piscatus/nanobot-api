@@ -8,10 +8,12 @@ import com.nanobot.nanobotbackend.dto.RequestDto;
 import com.nanobot.nanobotbackend.dto.TransferDto;
 import com.nanobot.nanobotbackend.dto.TransferResponseDto;
 import com.nanobot.nanobotbackend.dto.WalletDto;
+import com.nanobot.nanobotbackend.entity.CurrencyEntity;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;
 import com.nanobot.nanobotbackend.service.chain.ChainAdapter;
 import com.nanobot.nanobotbackend.service.chain.ChainAdapterRegistry;
+import com.nanobot.nanobotbackend.service.chain.FeeQuote;
 import com.nanobot.nanobotbackend.util.Constants;
 import com.nanobot.nanobotbackend.util.CryptoUtil;
 import com.nanobot.nanobotbackend.util.LoggingUtil;
@@ -102,6 +104,38 @@ public class SendServicesImpl implements SendServices {
       ") is not available right now, so withdrawals are paused.\n" +
       "-# This usually clears within a minute. Please try again shortly."
     );
+  }
+
+  /**
+   * The wallet's own fee for this withdrawal, or unavailable when it cannot be
+   * asked.
+   *
+   * <p>Goes through the entity rather than the DTO because the wallet
+   * credentials are deliberately absent from the DTO. Any exception is treated
+   * as unavailable: the quote improves the confirmation, it must never be the
+   * reason a withdrawal cannot be made.
+   */
+  private FeeQuote quoteWithdrawalFee(
+    CurrencyDto currencyDto,
+    String raw,
+    String address
+  ) {
+    try {
+      Optional<CurrencyEntity> currencyEntity =
+        currenciesService.getCurrencyByTicker(currencyDto.getTicker());
+      if (currencyEntity.isEmpty()) {
+        return FeeQuote.unavailable();
+      }
+      return chainAdapterRegistry
+        .get(currencyEntity.get())
+        .map(adapter ->
+          adapter.quoteWithdrawalFee(currencyEntity.get(), raw, address)
+        )
+        .orElse(FeeQuote.unavailable());
+    } catch (Exception e) {
+      LoggingUtil.errorLogging(Constants.COMMAND_NAME_SEND, e);
+      return FeeQuote.unavailable();
+    }
   }
 
   /**
@@ -525,6 +559,28 @@ public class SendServicesImpl implements SendServices {
                   return transferResponseDto;
                 }
               } else {
+                // Preview pass. Ask the wallet what this exact withdrawal would
+                // cost so the confirmation shows the real fee, and so a request
+                // the wallet cannot build is refused here, before any debit,
+                // instead of failing in the queue and being refunded.
+                FeeQuote quote = quoteWithdrawalFee(
+                  currencyDto,
+                  transferResponseDto
+                    .getPrimaryTransfer()
+                    .getWallets()
+                    .get(0)
+                    .getRaw(),
+                  requestDto.getAddress()
+                );
+                if (quote.status() == FeeQuote.Status.REJECTED) {
+                  transferResponseDto.setErrorMessage(
+                    quote.refusal().confirmationMessage()
+                  );
+                  return transferResponseDto;
+                }
+                if (quote.status() == FeeQuote.Status.QUOTED) {
+                  transferResponseDto.setNetworkFee(quote.fee().toString());
+                }
                 transferResponseDto.setConfirmation(true);
                 return transferResponseDto;
               }

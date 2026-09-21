@@ -44,9 +44,11 @@ NOTES:
 - The four *Difficulty fields are Nano proof of work and mean nothing elsewhere.
 - "confirmations" is the depth before a deposit is credited. Nano uses 1, Monero
   10, Bitcoin 6. Zero or negative is treated as unset.
-- "feeEstimate" is refreshed from the chain and is null on feeless networks. The
-  minimum a user must clear is minimumWithdraw + feeEstimate, so do not fold the
-  fee into the minimum.
+- "feeEstimate" is refreshed from the chain and is null on feeless networks. It
+  is the typical-size floor used for the minimum withdrawal, not the fee shown
+  at confirmation. Do not fold it into the minimum; the minimum a user must
+  clear is minimumWithdraw + feeEstimate. On /send the API quotes the exact fee
+  from the hot wallet when it can.
 - "feePriority" is 1 to 4. Monero maps it to transaction priority, Bitcoin to a
   confirmation target.
 - "supportsRepresentative" false hides the currency from /update.

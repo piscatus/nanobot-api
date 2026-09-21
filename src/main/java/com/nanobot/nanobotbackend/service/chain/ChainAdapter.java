@@ -59,4 +59,22 @@ public interface ChainAdapter {
   default boolean hasNetworkFee() {
     return true;
   }
+
+  /**
+   * The fee the hot wallet would charge to send {@code raw} to {@code address}
+   * right now, obtained by having the wallet build the transaction without
+   * relaying it.
+   *
+   * <p>The stored {@code feeEstimate} assumes a transaction size; the real fee
+   * depends on how many of the wallet's outputs have to be combined, which only
+   * the wallet knows. Feeless networks and adapters that cannot ask return
+   * {@link FeeQuote#unavailable()}, and callers fall back to the estimate.
+   */
+  default FeeQuote quoteWithdrawalFee(
+    CurrencyEntity currencyEntity,
+    String raw,
+    String address
+  ) {
+    return FeeQuote.unavailable();
+  }
 }

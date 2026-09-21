@@ -133,6 +133,67 @@ class BitcoinRpcClientTest {
     assertNull(client.wallet(currency(), "gettransaction", "deadbeef"));
   }
 
+  /**
+   * The withdrawal path needs to know which of Core's reasons applied, so the
+   * detailed variant has to hand back the code and message the plain one logs
+   * and discards.
+   */
+  @Test
+  void detailedCallsShouldKeepTheRpcError() {
+    server.enqueue(
+      new MockResponse()
+        .setResponseCode(HttpURLConnection.HTTP_INTERNAL_ERROR)
+        .setBody(
+          "{\"result\":null,\"error\":{\"code\":-6," +
+          "\"message\":\"Insufficient funds\"}}"
+        )
+    );
+
+    RpcResponse response = client.walletDetailed(
+      currency(),
+      "sendtoaddress",
+      "bc1qaaa",
+      "0.5"
+    );
+
+    assertFalse(response.isSuccess());
+    assertTrue(response.refused());
+    assertFalse(response.isTransportFailure());
+    assertEquals(-6, response.errorCode());
+    assertEquals("Insufficient funds", response.errorMessage());
+  }
+
+  @Test
+  void detailedCallsShouldReportAnUnreadableAnswerAsTransportFailure() {
+    server.enqueue(new MockResponse().setBody("not json at all"));
+
+    RpcResponse response = client.walletDetailed(currency(), "getbalances");
+
+    assertTrue(response.isTransportFailure());
+    assertFalse(response.refused());
+    assertNull(response.errorCode());
+  }
+
+  @Test
+  void detailedCallsShouldWrapScalarResultsLikeThePlainOnes() {
+    server.enqueue(
+      new MockResponse().setBody("{\"result\":\"txid123\",\"error\":null}")
+    );
+
+    RpcResponse response = client.walletDetailed(
+      currency(),
+      "sendtoaddress",
+      "bc1qaaa",
+      "0.5"
+    );
+
+    assertTrue(response.isSuccess());
+    assertEquals(
+      "txid123",
+      response.result().optString(BitcoinRpcClient.RESULT_KEY, null)
+    );
+  }
+
   @Test
   void nullErrorShouldNotBeTreatedAsAFailure() {
     server.enqueue(

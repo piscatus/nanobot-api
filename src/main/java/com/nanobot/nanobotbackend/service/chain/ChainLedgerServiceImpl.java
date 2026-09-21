@@ -390,6 +390,86 @@ public class ChainLedgerServiceImpl implements ChainLedgerService {
   }
 
   @Override
+  public void notifyWithdrawalDelayed(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    String reason,
+    Map<String, String> commandMap
+  ) {
+    if (queueEntity.getUserId() == null) {
+      return;
+    }
+
+    String decimalValue = currenciesService.getCurrencyDecimalValue(
+      queueEntity.getRaw(),
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
+
+    String header =
+      "<@" +
+      queueEntity.getUserId() +
+      ">'s withdrawal is *queued* and waiting to be sent.\n" +
+      reason +
+      "\n";
+
+    String progressNote =
+      "\n-# You will receive another message once it has been sent to the " +
+      "network. No action is needed.\n";
+
+    // No hash yet: nothing has been broadcast. The amount and address are
+    // repeated so the message stands on its own in a DM history.
+    String body =
+      "### 💸 __Currency Transfers__\n> **" +
+      decimalValue +
+      " " +
+      currencyEntity.getTicker() +
+      "** (≈$" +
+      currenciesService.getCurrencyDollarValue(
+        decimalValue,
+        currencyEntity.getValue()
+      ) +
+      ") " +
+      currencyEntity.getEmoji() +
+      "\n### 📌 __Withdrawal Address__\n> `" +
+      queueEntity.getTargetAddress() +
+      "`";
+
+    String title = "⏳ Withdrawal Queued";
+
+    messagesService.createMessage(
+      new MessageDto(
+        null,
+        System.getenv("HOME_SERVER_ID"),
+        System.getenv("WITHDRAWAL_LOGGING_CHANNEL_ID"),
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + body,
+        new Date(),
+        null,
+        null,
+        null
+      )
+    );
+
+    messagesService.createMessage(
+      new MessageDto(
+        queueEntity.getUserId(),
+        null,
+        null,
+        null,
+        title,
+        currencyEntity.getColor(),
+        header + progressNote + body,
+        new Date(),
+        null,
+        null,
+        null
+      )
+    );
+  }
+
+  @Override
   public void notifyWithdrawalConfirmed(
     CurrencyEntity currencyEntity,
     QueueEntity queueEntity,

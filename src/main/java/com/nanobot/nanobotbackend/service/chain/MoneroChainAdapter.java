@@ -15,10 +15,12 @@ import com.nanobot.nanobotbackend.service.QueuesService;
 import com.nanobot.nanobotbackend.task.FileLogger;
 import com.nanobot.nanobotbackend.util.Constants;
 import java.math.BigInteger;
-import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import org.bson.types.ObjectId;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -77,6 +79,22 @@ public class MoneroChainAdapter implements ChainAdapter {
   private static final int MAX_SEND_ATTEMPTS = 3;
 
   /**
+   * Log a louder warning every this many blocks a withdrawal has waited for
+   * locked funds. There is no give-up: the entry stays queued and is retried
+   * oldest-first until the wallet can spend.
+   */
+  private static final long DEFERRAL_WARNING_INTERVAL_BLOCKS = 30L;
+
+  // monero-wallet-rpc error codes, from wallet_rpc_server_error_codes.h.
+  static final int RPC_WRONG_ADDRESS = -2;
+  static final int RPC_TX_NOT_POSSIBLE = -16;
+  static final int RPC_NOT_ENOUGH_MONEY = -17;
+  static final int RPC_TX_TOO_LARGE = -18;
+  static final int RPC_NOT_ENOUGH_UNLOCKED_MONEY = -37;
+  static final int RPC_NO_DAEMON_CONNECTION = -38;
+  static final int RPC_ZERO_AMOUNT = -46;
+
+  /**
    * How often to re-scan the wallet's entire incoming history instead of just
    * the window around the cursor.
    *
@@ -105,6 +123,22 @@ public class MoneroChainAdapter implements ChainAdapter {
   private static final long POOL_SCAN_INTERVAL_MS = 10L * 1000L;
 
   private volatile long lastPoolScanMillis = 0L;
+
+  /**
+   * Daemon height at which each waiting withdrawal was last refused for locked
+   * funds, by queue id. A locked output only changes state when a block
+   * arrives, so there is no point asking the wallet again before then; this
+   * keeps a waiting entry to one attempt per block instead of one per second.
+   * Deliberately in memory: a restart just retries immediately, which is
+   * harmless.
+   */
+  private final Map<String, Long> deferredAtHeight = new ConcurrentHashMap<>();
+
+  /**
+   * Queue ids whose owner has been told their withdrawal is waiting. In memory
+   * for the same reason; a restart may repeat the notice once.
+   */
+  private final Set<String> delayNoticed = ConcurrentHashMap.newKeySet();
 
   private static final String ACCOUNT_INDEX = "account_index";
   private static final String ADDRESS_KEY = "address";
@@ -147,6 +181,233 @@ public class MoneroChainAdapter implements ChainAdapter {
   @Override
   public boolean supportsRepresentative() {
     return false;
+  }
+
+  /**
+   * Asks the wallet to build the exact transaction a withdrawal would send,
+   * without relaying it, and reports the fee it settled on.
+   *
+   * <p>{@code do_not_relay} stops short of committing, so nothing is marked
+   * spent and the real send later selects afresh. The parameters are the ones
+   * {@link #processSend} uses, so the two cannot drift apart.
+   *
+   * <p>A refusal for locked funds is reported as unavailable rather than
+   * rejected: the queue processor waits those out, so the withdrawal should be
+   * accepted with the estimate shown. Every other refusal is a verdict on the
+   * request and is surfaced so the user hears it before anything is debited.
+   */
+  @Override
+  public FeeQuote quoteWithdrawalFee(
+    CurrencyEntity currencyEntity,
+    String raw,
+    String address
+  ) {
+    JSONObject params;
+    try {
+      params = buildTransferParams(currencyEntity, raw, address);
+    } catch (RuntimeException e) {
+      fileLogger.warn(
+        "Could not build a " +
+        currencyEntity.getTicker() +
+        " fee quote for " +
+        raw +
+        ": " +
+        e.getMessage()
+      );
+      return FeeQuote.unavailable();
+    }
+    params.put("do_not_relay", true);
+
+    RpcResponse response = rpc.walletDetailed(currencyEntity, "transfer", params);
+    if (response.isSuccess()) {
+      long fee = response.result().optLong("fee", -1L);
+      if (fee < 0L) {
+        return FeeQuote.unavailable();
+      }
+      fileLogger.info(
+        "Quoted " +
+        currencyEntity.getTicker() +
+        " withdrawal of " +
+        raw +
+        ": fee " +
+        fee +
+        " (weight " +
+        response.result().optLong("weight", 0L) +
+        ")"
+      );
+      return FeeQuote.quoted(BigInteger.valueOf(fee));
+    }
+
+    WalletRefusal refusal = classifyRefusal(currencyEntity, response);
+    if (refusal.isTransient()) {
+      return FeeQuote.unavailable();
+    }
+    logOperatorConcern(currencyEntity, refusal, "fee quote for " + raw);
+    return FeeQuote.rejected(refusal);
+  }
+
+  /**
+   * The {@code transfer} request for a withdrawal. Shared by the fee quote and
+   * the real send.
+   *
+   * <p>The user is debited the full amount and the network fee is taken out of
+   * what they receive. That keeps the ledger exactly balanced: the hot wallet
+   * drops by precisely the amount burned from the user's balance.
+   */
+  JSONObject buildTransferParams(
+    CurrencyEntity currencyEntity,
+    String raw,
+    String address
+  ) {
+    JSONObject destination = new JSONObject()
+      .put(AMOUNT_KEY, new BigInteger(raw).longValueExact())
+      .put(ADDRESS_KEY, address);
+    return new JSONObject()
+      .put("destinations", new JSONArray().put(destination))
+      .put(ACCOUNT_INDEX, 0)
+      .put("priority", resolveFeePriority(currencyEntity))
+      .put("ring_size", 16)
+      .put("subtract_fee_from_outputs", new JSONArray().put(0))
+      .put("get_tx_key", true);
+  }
+
+  /**
+   * Turns a failed {@code transfer} into something the rest of the adapter can
+   * act on, with wording a user can be shown.
+   *
+   * <p>Keyed on the RPC error code, with the message text as a fallback so a
+   * wallet version that numbers things differently still lands somewhere
+   * sensible rather than in OTHER.
+   */
+  WalletRefusal classifyRefusal(
+    CurrencyEntity currencyEntity,
+    RpcResponse response
+  ) {
+    WalletRefusal.Kind kind = response.isTransportFailure()
+      ? WalletRefusal.Kind.UNREACHABLE
+      : classifyCode(response.errorCode(), response.errorMessage());
+    String name = currencyEntity.getName();
+    return switch (kind) {
+      case FEE_EXCEEDS_AMOUNT -> new WalletRefusal(
+        kind,
+        "The network fee would exceed the amount requested, so the " +
+        "transaction could not be created.",
+        "The current minimum withdrawal, including network fees, is **" +
+        effectiveMinimum(currencyEntity) +
+        " " +
+        currencyEntity.getTicker() +
+        "**."
+      );
+      case FUNDS_LOCKED -> new WalletRefusal(
+        kind,
+        "The bot's " +
+        name +
+        " wallet is briefly locked while a recent transaction settles " +
+        "(about 20 minutes)."
+      );
+      case INSUFFICIENT_FUNDS -> new WalletRefusal(
+        kind,
+        "The bot's " +
+        name +
+        " wallet cannot cover this withdrawal plus the network fee right now.",
+        "Try a slightly smaller amount, or try again later."
+      );
+      case TX_TOO_LARGE -> new WalletRefusal(
+        kind,
+        "This withdrawal would need more inputs than fit in a single " +
+        name +
+        " transaction.",
+        "Try a smaller amount, or try again later."
+      );
+      case ADDRESS_REJECTED -> new WalletRefusal(
+        kind,
+        "The " + name + " wallet rejected the destination address."
+      );
+      case UNREACHABLE -> new WalletRefusal(
+        kind,
+        "The bot's " + name + " wallet is not responding right now."
+      );
+      case OTHER -> new WalletRefusal(
+        kind,
+        "The bot's " + name + " wallet could not create this transaction."
+      );
+    };
+  }
+
+  static WalletRefusal.Kind classifyCode(Integer code, String message) {
+    if (code != null) {
+      switch (code) {
+        case RPC_NOT_ENOUGH_UNLOCKED_MONEY:
+          return WalletRefusal.Kind.FUNDS_LOCKED;
+        case RPC_NOT_ENOUGH_MONEY:
+          return WalletRefusal.Kind.INSUFFICIENT_FUNDS;
+        case RPC_TX_NOT_POSSIBLE:
+        case RPC_ZERO_AMOUNT:
+          return WalletRefusal.Kind.FEE_EXCEEDS_AMOUNT;
+        case RPC_TX_TOO_LARGE:
+          return WalletRefusal.Kind.TX_TOO_LARGE;
+        case RPC_WRONG_ADDRESS:
+          return WalletRefusal.Kind.ADDRESS_REJECTED;
+        case RPC_NO_DAEMON_CONNECTION:
+          return WalletRefusal.Kind.UNREACHABLE;
+        default:
+          break;
+      }
+    }
+    String text = message == null ? "" : message.toLowerCase(Locale.ROOT);
+    if (text.contains("unlocked")) {
+      return WalletRefusal.Kind.FUNDS_LOCKED;
+    }
+    if (text.contains("not enough money")) {
+      return WalletRefusal.Kind.INSUFFICIENT_FUNDS;
+    }
+    if (text.contains("not possible") || text.contains("greater than")) {
+      return WalletRefusal.Kind.FEE_EXCEEDS_AMOUNT;
+    }
+    if (text.contains("too large")) {
+      return WalletRefusal.Kind.TX_TOO_LARGE;
+    }
+    if (text.contains("address")) {
+      return WalletRefusal.Kind.ADDRESS_REJECTED;
+    }
+    if (text.contains("daemon")) {
+      return WalletRefusal.Kind.UNREACHABLE;
+    }
+    return WalletRefusal.Kind.OTHER;
+  }
+
+  private String effectiveMinimum(CurrencyEntity currencyEntity) {
+    return currenciesService.getCurrencyDecimalValue(
+      currenciesService.getEffectiveMinimumWithdraw(
+        new CurrencyDto(currencyEntity)
+      ),
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
+  }
+
+  /**
+   * Some refusals are about the hot wallet rather than the request and need
+   * an operator to look: a shortfall means liabilities exceed what the wallet
+   * holds, and an oversized transaction means the outputs need consolidating.
+   */
+  private void logOperatorConcern(
+    CurrencyEntity currencyEntity,
+    WalletRefusal refusal,
+    String context
+  ) {
+    if (
+      refusal.kind() == WalletRefusal.Kind.INSUFFICIENT_FUNDS ||
+      refusal.kind() == WalletRefusal.Kind.TX_TOO_LARGE
+    ) {
+      fileLogger.error(
+        currencyEntity.getTicker() +
+        " wallet refused a " +
+        context +
+        " with " +
+        refusal.kind() +
+        "; this needs attention."
+      );
+    }
   }
 
   @Override
@@ -745,10 +1006,9 @@ public class MoneroChainAdapter implements ChainAdapter {
     long daemonHeight
   ) {
     String ticker = currencyEntity.getTicker();
-    for (QueueEntity queueEntity : queuesService.getQueues()) {
-      if (!ticker.equals(queueEntity.getTicker())) {
-        continue;
-      }
+    // Oldest first so a waiting withdrawal is not skipped in favour of a newer
+    // one. Each send is its own transaction; grouping comes later if needed.
+    for (QueueEntity queueEntity : queuesService.getQueuesByTicker(ticker)) {
       if (queueEntity.getLevel() == LevelDto.UPDATE) {
         // Monero has no representative to set. Such an entry can only be a
         // misconfiguration, so drop it rather than leave it queued forever.
@@ -817,6 +1077,13 @@ public class MoneroChainAdapter implements ChainAdapter {
       }
     }
 
+    // A withdrawal waiting for locked funds is only worth retrying once the
+    // chain has moved, since that is the only thing that can unlock them.
+    Long deferredAt = deferredAtHeight.get(queueEntity.getId());
+    if (deferredAt != null && daemonHeight <= deferredAt) {
+      return;
+    }
+
     // Mark the attempt height first so the recovery scan above has a lower
     // bound if this process dies mid-send.
     if (queueEntity.getIndex() == null) {
@@ -830,30 +1097,47 @@ public class MoneroChainAdapter implements ChainAdapter {
       );
     }
 
-    JSONObject destination = new JSONObject()
-      .put(AMOUNT_KEY, new BigInteger(queueEntity.getRaw()).longValueExact())
-      .put(ADDRESS_KEY, queueEntity.getTargetAddress());
-
-    JSONObject result = rpc.wallet(
+    RpcResponse response = rpc.walletDetailed(
       currencyEntity,
       "transfer",
-      new JSONObject()
-        .put("destinations", new JSONArray().put(destination))
-        .put(ACCOUNT_INDEX, 0)
-        .put("priority", resolveFeePriority(currencyEntity))
-        .put("ring_size", 16)
-        // The user is debited the full amount and the network fee is taken out
-        // of what they receive. That keeps the ledger exactly balanced: the hot
-        // wallet drops by precisely the amount burned from the user's balance.
-        .put("subtract_fee_from_outputs", new JSONArray().put(0))
-        .put("get_tx_key", true)
+      buildTransferParams(
+        currencyEntity,
+        queueEntity.getRaw(),
+        queueEntity.getTargetAddress()
+      )
     );
 
-    if (result == null || !result.has(TX_HASH_KEY)) {
-      handleSendFailure(queueEntity, currencyEntity, commandMap);
+    if (!response.isSuccess() || !response.result().has(TX_HASH_KEY)) {
+      WalletRefusal refusal = classifyRefusal(currencyEntity, response);
+      switch (refusal.kind()) {
+        case UNREACHABLE -> fileLogger.warn(
+          // Not counted as an attempt: the send was never judged. The entry
+          // waits for the wallet to come back, as a brief outage must not
+          // cancel a good withdrawal.
+          "Could not reach the " +
+          currencyEntity.getTicker() +
+          " wallet for queue #" +
+          queueEntity.getId() +
+          "; will retry."
+        );
+        case FUNDS_LOCKED -> deferSend(
+          queueEntity,
+          currencyEntity,
+          daemonHeight,
+          commandMap
+        );
+        default -> handleSendFailure(
+          queueEntity,
+          currencyEntity,
+          refusal,
+          commandMap
+        );
+      }
       return;
     }
 
+    JSONObject result = response.result();
+    clearDeferral(queueEntity.getId());
     queueEntity.setBlockHash(result.getString(TX_HASH_KEY));
     queueEntity.setProcessed(true);
     queuesService.updateQueueProgress(
@@ -886,18 +1170,129 @@ public class MoneroChainAdapter implements ChainAdapter {
   }
 
   /**
-   * Counts a failed send attempt and, once attempts are exhausted, refunds the
-   * user rather than retrying forever.
+   * Holds a withdrawal the wallet refused for lack of unlocked funds.
    *
-   * <p>The common permanent failure is a fee larger than the amount being sent:
-   * with the fee deducted from the output there is nothing left to pay the
-   * recipient, and that fails identically on every retry. Since the balance was
-   * already debited when the withdrawal was queued, leaving it queued would
-   * strand the user's funds indefinitely.
+   * <p>Nothing is wrong with the request: the wallet holds the money, some of
+   * it is just inside the 10-block lock that follows every send, usually the
+   * change from the withdrawal before this one. The entry is left queued and
+   * asked again when the next block lands, and its owner is told once that it
+   * is waiting rather than lost. Attempts are not counted, because counting
+   * them would turn a normal wait into a refund with a misleading reason.
+   * There is no time bound: older entries stay at the front of the queue
+   * until the wallet can spend.
+   */
+  private void deferSend(
+    QueueEntity queueEntity,
+    CurrencyEntity currencyEntity,
+    long daemonHeight,
+    Map<String, String> commandMap
+  ) {
+    String id = queueEntity.getId();
+    long since = queueEntity.getIndex() == null
+      ? daemonHeight
+      : queueEntity.getIndex();
+    long waited = Math.max(0L, daemonHeight - since);
+
+    deferredAtHeight.put(id, daemonHeight);
+    String snapshot = balanceSnapshot(currencyEntity);
+
+    if (delayNoticed.add(id)) {
+      chainLedgerService.notifyWithdrawalDelayed(
+        currencyEntity,
+        queueEntity,
+        "Monero locks funds for 10 blocks (about 20 minutes) after every " +
+        "send, and the bot's wallet is waiting for a recent transaction to " +
+        "unlock. Your withdrawal will be sent automatically once it does.",
+        commandMap
+      );
+      fileLogger.warn(
+        "Deferring " +
+        currencyEntity.getTicker() +
+        " withdrawal for queue #" +
+        id +
+        ": not enough unlocked funds (" +
+        snapshot +
+        "). Will retry as blocks arrive."
+      );
+      return;
+    }
+
+    if (waited > 0 && waited % DEFERRAL_WARNING_INTERVAL_BLOCKS == 0) {
+      fileLogger.warn(
+        currencyEntity.getTicker() +
+        " withdrawal for queue #" +
+        id +
+        " still waiting after " +
+        waited +
+        " blocks (" +
+        snapshot +
+        ")."
+      );
+    } else {
+      fileLogger.info(
+        "Queue #" +
+        id +
+        " still waiting for unlocked " +
+        currencyEntity.getTicker() +
+        " at height " +
+        daemonHeight +
+        " (" +
+        snapshot +
+        ")."
+      );
+    }
+  }
+
+  /** "unlocked X of Y TICKER, N blocks to unlock", for the deferral log lines. */
+  private String balanceSnapshot(CurrencyEntity currencyEntity) {
+    JSONObject balance = rpc.wallet(
+      currencyEntity,
+      "get_balance",
+      new JSONObject().put(ACCOUNT_INDEX, 0)
+    );
+    if (balance == null) {
+      return "balance unavailable";
+    }
+    int precision = Integer.parseInt(currencyEntity.getPrecision());
+    return (
+      "unlocked " +
+      currenciesService.getCurrencyDecimalValue(
+        String.valueOf(balance.optLong("unlocked_balance", 0L)),
+        precision
+      ) +
+      " of " +
+      currenciesService.getCurrencyDecimalValue(
+        String.valueOf(balance.optLong("balance", 0L)),
+        precision
+      ) +
+      " " +
+      currencyEntity.getTicker() +
+      ", " +
+      balance.optLong("blocks_to_unlock", 0L) +
+      " blocks to unlock"
+    );
+  }
+
+  private void clearDeferral(String queueId) {
+    deferredAtHeight.remove(queueId);
+    delayNoticed.remove(queueId);
+  }
+
+  /**
+   * Counts a refused send attempt and, once attempts are exhausted, refunds the
+   * user with the wallet's reason rather than retrying forever.
+   *
+   * <p>Only refusals reach here: a wallet that did not answer is not counted,
+   * and a wallet short of unlocked funds is deferred instead. What is left
+   * fails identically on every retry - a fee larger than the amount, a wallet
+   * that does not hold enough, a transaction that would be too large - and
+   * since the balance was debited when the withdrawal was queued, leaving it
+   * queued would strand the user's funds indefinitely.
    */
   private void handleSendFailure(
     QueueEntity queueEntity,
     CurrencyEntity currencyEntity,
+    WalletRefusal refusal,
     Map<String, String> commandMap
   ) {
     int attempts =
@@ -916,7 +1311,9 @@ public class MoneroChainAdapter implements ChainAdapter {
       currencyEntity.getTicker() +
       " withdrawal for queue #" +
       queueEntity.getId() +
-      " (attempt " +
+      " (" +
+      refusal.kind() +
+      ", attempt " +
       attempts +
       " of " +
       MAX_SEND_ATTEMPTS +
@@ -927,8 +1324,30 @@ public class MoneroChainAdapter implements ChainAdapter {
       return;
     }
 
-    // Never refund without proving nothing reached the network, or the user
-    // would be credited for a withdrawal they actually received.
+    logOperatorConcern(
+      currencyEntity,
+      refusal,
+      "withdrawal for queue #" + queueEntity.getId()
+    );
+    refundIfNotBroadcast(
+      queueEntity,
+      currencyEntity,
+      refusal.refundMessage(),
+      commandMap
+    );
+  }
+
+  /**
+   * Refunds a withdrawal, but only after proving nothing reached the network;
+   * otherwise the user would be credited for a withdrawal they also received.
+   * An inconclusive check holds the entry for review instead.
+   */
+  private void refundIfNotBroadcast(
+    QueueEntity queueEntity,
+    CurrencyEntity currencyEntity,
+    String reason,
+    Map<String, String> commandMap
+  ) {
     BroadcastCheck check = findAlreadySentTx(
       queueEntity,
       currencyEntity,
@@ -946,8 +1365,8 @@ public class MoneroChainAdapter implements ChainAdapter {
       fileLogger.error(
         "Withdrawal for queue #" +
         queueEntity.getId() +
-        " has exhausted its attempts, but the wallet cannot confirm whether it " +
-        "was broadcast. Holding for manual review rather than refunding blind."
+        " cannot be sent, but the wallet cannot confirm whether it was " +
+        "broadcast. Holding for manual review rather than refunding blind."
       );
       return;
     }
@@ -960,28 +1379,12 @@ public class MoneroChainAdapter implements ChainAdapter {
         check.txid() +
         "; recording it instead of refunding."
       );
+      clearDeferral(queueEntity.getId());
       queueEntity.setBlockHash(check.txid());
       queueEntity.setProcessed(true);
       queuesService.updateQueue(queueEntity.getId(), new QueueDto(queueEntity));
       return;
     }
-
-    String minimum = currenciesService.getCurrencyDecimalValue(
-      currenciesService.getEffectiveMinimumWithdraw(
-        new CurrencyDto(currencyEntity)
-      ),
-      Integer.parseInt(currencyEntity.getPrecision())
-    );
-
-    String reason =
-      "## Network fees exceeded the amount requested, so the transaction could " +
-      "not be created. Your funds were **not** sent and have been returned to " +
-      "your balance.\n" +
-      "-# The current minimum withdrawal, including network fees, is **" +
-      minimum +
-      " " +
-      currencyEntity.getTicker() +
-      "**.";
 
     String refundTransactionId = chainLedgerService.refundFailedWithdrawal(
       currencyEntity,
@@ -993,6 +1396,7 @@ public class MoneroChainAdapter implements ChainAdapter {
     // Only drop the queue entry once the refund is booked. If it failed the
     // entry stays so the discrepancy stays visible instead of vanishing.
     if (refundTransactionId != null) {
+      clearDeferral(queueEntity.getId());
       queuesService.deleteQueue(queueEntity.getId());
     }
   }

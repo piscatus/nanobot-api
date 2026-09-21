@@ -17,12 +17,16 @@ import com.nanobot.nanobotbackend.dto.TransferDto;
 import com.nanobot.nanobotbackend.dto.TransferResponseDto;
 import com.nanobot.nanobotbackend.dto.UserDetailsDto;
 import com.nanobot.nanobotbackend.dto.WalletDto;
+import com.nanobot.nanobotbackend.entity.CurrencyEntity;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;
 import com.nanobot.nanobotbackend.service.chain.ChainAdapter;
 import com.nanobot.nanobotbackend.service.chain.ChainAdapterRegistry;
+import com.nanobot.nanobotbackend.service.chain.FeeQuote;
+import com.nanobot.nanobotbackend.service.chain.WalletRefusal;
 import com.nanobot.nanobotbackend.util.Constants;
 import java.lang.reflect.Field;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -255,6 +259,142 @@ class SendServicesImplTest {
     verify(transferExecutorService, never())
       .executeTransfer(anyString(), anyString(), anyString(), anyString(), any(), any(), any(), any());
     verify(queuesService, never()).createQueue(any());
+  }
+
+  /**
+   * The stored estimate assumes a transaction size. The confirmation should
+   * carry the fee the wallet actually quoted for this withdrawal.
+   */
+  @Test
+  void sendCarriesTheWalletsFeeQuoteOnTheConfirmationPass() {
+    stubCoreAccess("user-1");
+    stubCurrencies(true);
+    stubCreatures();
+    when(
+      transferService.processInputs(
+        anyString(),
+        any(),
+        any(),
+        anyString(),
+        anyString(),
+        anyString(),
+        anyBoolean()
+      )
+    )
+      .thenReturn(transferWithWallet("XNO", "25"));
+    when(userDetailsService.getUserDetailsByUserId(any()))
+      .thenReturn(Optional.of(botUser("0")));
+
+    CurrencyEntity entity = new CurrencyEntity();
+    entity.setTicker("XNO");
+    ChainAdapter adapter = mock(ChainAdapter.class);
+    when(currenciesService.getCurrencyByTicker("XNO"))
+      .thenReturn(Optional.of(entity));
+    when(chainAdapterRegistry.get(entity)).thenReturn(Optional.of(adapter));
+    when(adapter.quoteWithdrawalFee(entity, "25", VALID_NANO_ADDRESS))
+      .thenReturn(FeeQuote.quoted(BigInteger.valueOf(7)));
+
+    TransferResponseDto result = sendServices.send(
+      sendRequest(false, VALID_NANO_ADDRESS)
+    );
+
+    assertNull(result.getErrorMessage());
+    assertTrue(result.getConfirmation());
+    assertEquals("7", result.getNetworkFee());
+    verify(queuesService, never()).createQueue(any());
+  }
+
+  /**
+   * A withdrawal the wallet cannot build would otherwise be debited, fail three
+   * times in the queue and be refunded. Saying so at confirmation is cheaper
+   * for everyone.
+   */
+  @Test
+  void sendRejectsAWithdrawalTheWalletRefusesToBuild() {
+    stubCoreAccess("user-1");
+    stubCurrencies(true);
+    stubCreatures();
+    when(
+      transferService.processInputs(
+        anyString(),
+        any(),
+        any(),
+        anyString(),
+        anyString(),
+        anyString(),
+        anyBoolean()
+      )
+    )
+      .thenReturn(transferWithWallet("XNO", "25"));
+    when(userDetailsService.getUserDetailsByUserId(any()))
+      .thenReturn(Optional.of(botUser("0")));
+
+    CurrencyEntity entity = new CurrencyEntity();
+    entity.setTicker("XNO");
+    ChainAdapter adapter = mock(ChainAdapter.class);
+    when(currenciesService.getCurrencyByTicker("XNO"))
+      .thenReturn(Optional.of(entity));
+    when(chainAdapterRegistry.get(entity)).thenReturn(Optional.of(adapter));
+    when(adapter.quoteWithdrawalFee(entity, "25", VALID_NANO_ADDRESS))
+      .thenReturn(
+        FeeQuote.rejected(
+          new WalletRefusal(
+            WalletRefusal.Kind.FEE_EXCEEDS_AMOUNT,
+            "The network fee would exceed the amount requested."
+          )
+        )
+      );
+
+    TransferResponseDto result = sendServices.send(
+      sendRequest(false, VALID_NANO_ADDRESS)
+    );
+
+    assertNotNull(result.getErrorMessage());
+    assertTrue(result.getErrorMessage().contains("network fee would exceed"));
+    assertTrue(result.getErrorMessage().contains("Nothing has been debited"));
+    assertFalse(result.getConfirmation());
+    assertNull(result.getNetworkFee());
+    verify(transferExecutorService, never())
+      .executeTransfer(anyString(), anyString(), anyString(), anyString(), any(), any(), any(), any());
+  }
+
+  /** The quote improves the confirmation; it must never block a withdrawal. */
+  @Test
+  void sendStillConfirmsWhenNoQuoteIsAvailable() {
+    stubCoreAccess("user-1");
+    stubCurrencies(true);
+    stubCreatures();
+    when(
+      transferService.processInputs(
+        anyString(),
+        any(),
+        any(),
+        anyString(),
+        anyString(),
+        anyString(),
+        anyBoolean()
+      )
+    )
+      .thenReturn(transferWithWallet("XNO", "25"));
+    when(userDetailsService.getUserDetailsByUserId(any()))
+      .thenReturn(Optional.of(botUser("0")));
+
+    CurrencyEntity entity = new CurrencyEntity();
+    entity.setTicker("XNO");
+    ChainAdapter adapter = mock(ChainAdapter.class);
+    when(currenciesService.getCurrencyByTicker("XNO"))
+      .thenReturn(Optional.of(entity));
+    when(chainAdapterRegistry.get(entity)).thenReturn(Optional.of(adapter));
+    when(adapter.quoteWithdrawalFee(entity, "25", VALID_NANO_ADDRESS))
+      .thenReturn(FeeQuote.unavailable());
+
+    TransferResponseDto result = sendServices.send(
+      sendRequest(false, VALID_NANO_ADDRESS)
+    );
+
+    assertNull(result.getErrorMessage());
+    assertTrue(result.getConfirmation());
+    assertNull(result.getNetworkFee());
   }
 
   /**

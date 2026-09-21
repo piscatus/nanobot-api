@@ -182,8 +182,24 @@ is in. Collapsing the last two is how a user gets paid twice.
   check is conclusive and found nothing. An inconclusive check holds the entry
   for review instead.
 - The refund restores the full debited amount, fee portion included, and the
-  queue entry is only removed once the refund is booked.
+  queue entry is only removed once the refund is booked. The message names the
+  wallet's actual reason: fee larger than the amount, not enough funds, too many
+  inputs, or a rejected address.
 - Sweeps have no user behind them and are never refunded.
+
+### Locked funds (Monero)
+
+- Incoming outputs, including the wallet's own change, cannot be spent for 10
+  blocks. A withdrawal the unlocked balance cannot cover is refused with `-37`.
+  That is a wait, not a failure: the entry stays queued, is retried when the
+  next block arrives, and the user is told once that it is waiting. Attempts
+  are not counted. There is no give-up timer; older entries are processed
+  before newer ones, each as its own transaction.
+- Capacity is the number of unlocked outputs. With a dozen large outputs, a
+  dozen withdrawals can go out in one 20-minute window. The wallet setting
+  `min-outputs-count 100` / `min-outputs-value 0.001` stops optional tidy-up
+  inputs from merging those outputs. Operators inspect and split them with
+  `monero-node/xmr-outputs.sh`.
 
 ### Fees
 
@@ -193,7 +209,15 @@ is in. Collapsing the last two is how a user gets paid twice.
   balanced.
 - `feeEstimate` is stored separately from `minimumWithdraw`. Folding it in would
   compound on every refresh and drive the minimum up without bound. The
-  effective minimum is the sum of the two.
+  effective minimum is the sum of the two. It is a typical-size floor, not the
+  fee shown at confirmation.
+- On the /send preview pass the adapter asks the wallet to build the exact
+  transaction without relaying it (Monero `transfer` with `do_not_relay`,
+  Bitcoin `walletcreatefundedpsbt`). The quoted fee is what the confirmation
+  embed shows. A refusal that is not a wait (fee larger than the amount, not
+  enough funds, too many inputs, bad address) is returned before any debit. A
+  wait or an unreachable wallet leaves `networkFee` unset and the frontend
+  falls back to the estimate.
 - A fee-bearing currency with no usable estimate refuses withdrawals rather than
   falling back to the bare minimum, which would accept an amount the fee will
   consume. `ChainAdapter.hasNetworkFee` decides this, so it is a property of the
@@ -245,7 +269,9 @@ Chain-relevant fields on a currency document:
   unset, since crediting at zero would let an unconfirmed transaction be spent.
 - `precision` - decimals in one whole unit. All amounts are stored as integer
   strings in the smallest unit.
-- `feeEstimate`, `feePriority` - refreshed from the chain; see Fees above.
+- `feeEstimate`, `feePriority` - `feeEstimate` is the typical-size floor and
+  the display fallback; the confirmation quotes the wallet when it can. See
+  Fees above.
 - `lastScannedHeight` - deposit scan cursor, written by the adapter.
 - `liquidity` - what the hot wallet holds, total rather than spendable, so a
   transient lock does not make a solvent wallet look empty.

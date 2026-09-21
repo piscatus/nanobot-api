@@ -60,6 +60,24 @@ public class MoneroWalletRpcClient {
   }
 
   /**
+   * Like {@link #wallet}, but keeps the failure detail. For the withdrawal
+   * path, which has to tell a wallet that refused from a wallet that is down.
+   */
+  public RpcResponse walletDetailed(
+    CurrencyEntity currency,
+    String method,
+    JSONObject params
+  ) {
+    return callDetailed(
+      currency.getWalletRpcUrl(),
+      currency.getWalletRpcUser(),
+      currency.getWalletRpcPassword(),
+      method,
+      params
+    );
+  }
+
+  /**
    * Calls the daemon RPC. Used only for cheap height checks, so that the
    * expensive wallet scan runs only when the chain actually moved.
    */
@@ -83,9 +101,24 @@ public class MoneroWalletRpcClient {
     String method,
     JSONObject params
   ) {
+    return callDetailed(url, user, password, method, params).result();
+  }
+
+  /**
+   * The same call with the outcome preserved: a successful result, an RPC
+   * error with its code and message, or a transport failure. Everything is
+   * still logged here so callers do not have to.
+   */
+  public RpcResponse callDetailed(
+    String url,
+    String user,
+    String password,
+    String method,
+    JSONObject params
+  ) {
     if (url == null || url.isBlank()) {
       fileLogger.error("No RPC url configured for method " + method);
-      return null;
+      return RpcResponse.unreachable("no RPC url configured");
     }
     JSONObject body = new JSONObject()
       .put("jsonrpc", "2.0")
@@ -104,7 +137,7 @@ public class MoneroWalletRpcClient {
           .orElse(null);
         if (challenge == null) {
           fileLogger.error("401 from " + url + " without a digest challenge");
-          return null;
+          return RpcResponse.unreachable("401 without a digest challenge");
         }
         String authorization = buildDigestHeader(
           challenge,
@@ -114,7 +147,7 @@ public class MoneroWalletRpcClient {
           JSON_RPC_PATH
         );
         if (authorization == null) {
-          return null;
+          return RpcResponse.unreachable("unusable digest challenge");
         }
         response = send(url, body, authorization);
       }
@@ -123,28 +156,28 @@ public class MoneroWalletRpcClient {
         fileLogger.error(
           "RPC " + method + " to " + url + " returned " + response.statusCode()
         );
-        return null;
+        return RpcResponse.unreachable("HTTP " + response.statusCode());
       }
 
       JSONObject parsed = new JSONObject(response.body());
       if (parsed.has("error")) {
         JSONObject error = parsed.getJSONObject("error");
-        fileLogger.error(
-          "RPC " +
-          method +
-          " error " +
-          error.optInt("code") +
-          ": " +
-          error.optString("message")
-        );
-        return null;
+        Integer code = error.has("code") ? error.optInt("code") : null;
+        String message = error.optString("message");
+        fileLogger.error("RPC " + method + " error " + code + ": " + message);
+        return RpcResponse.refused(code, message);
       }
-      return parsed.optJSONObject("result");
+      JSONObject result = parsed.optJSONObject("result");
+      if (result == null) {
+        fileLogger.error("RPC " + method + " returned no result object");
+        return RpcResponse.unreachable("no result object");
+      }
+      return RpcResponse.success(result);
     } catch (Exception e) {
       fileLogger.error(
         "RPC " + method + " to " + url + " failed: " + e.getMessage()
       );
-      return null;
+      return RpcResponse.unreachable(String.valueOf(e.getMessage()));
     }
   }
 

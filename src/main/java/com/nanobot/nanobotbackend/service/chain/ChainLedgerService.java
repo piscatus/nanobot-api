@@ -86,6 +86,21 @@ public interface ChainLedgerService {
     Map<String, String> commandMap
   );
 
+  /**
+   * Tells a user their withdrawal is queued and waiting on the hot wallet
+   * rather than failed, so a delay of some minutes does not look like a lost
+   * /send. Deduplication is the caller's job; this writes a message every time.
+   *
+   * @param reason one or two user-facing sentences saying what is being
+   *     waited for and that no action is needed
+   */
+  void notifyWithdrawalDelayed(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    String reason,
+    Map<String, String> commandMap
+  );
+
   /** Notifies a user that their withdrawal reached the required confirmations. */
   void notifyWithdrawalConfirmed(
     CurrencyEntity currencyEntity,

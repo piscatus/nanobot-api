@@ -67,6 +67,24 @@ public class BitcoinRpcClient {
   }
 
   /**
+   * Like {@link #wallet}, but keeps the failure detail. For the withdrawal
+   * path, which has to tell a wallet that refused from a wallet that is down.
+   */
+  public RpcResponse walletDetailed(
+    CurrencyEntity currency,
+    String method,
+    Object... params
+  ) {
+    return callDetailed(
+      currency.getWalletRpcUrl(),
+      currency.getWalletRpcUser(),
+      currency.getWalletRpcPassword(),
+      method,
+      params
+    );
+  }
+
+  /**
    * Calls a node-level method such as getblockchaininfo, on the wallet-less
    * endpoint. Credentials are the wallet's, since bitcoind authenticates every
    * RPC against the same user.
@@ -101,9 +119,24 @@ public class BitcoinRpcClient {
     String method,
     Object... params
   ) {
+    return callDetailed(url, user, password, method, params).result();
+  }
+
+  /**
+   * The same call with the outcome preserved: a successful result, an RPC
+   * error with its code and message, or a transport failure. Everything is
+   * still logged here so callers do not have to.
+   */
+  public RpcResponse callDetailed(
+    String url,
+    String user,
+    String password,
+    String method,
+    Object... params
+  ) {
     if (url == null || url.isBlank()) {
       fileLogger.error("No RPC url configured for method " + method);
-      return null;
+      return RpcResponse.unreachable("no RPC url configured");
     }
 
     JSONArray arguments = new JSONArray();
@@ -143,36 +176,34 @@ public class BitcoinRpcClient {
 
       if (parsed != null && !parsed.isNull("error")) {
         JSONObject error = parsed.optJSONObject("error");
-        fileLogger.error(
-          "RPC " +
-          method +
-          " error " +
-          (error == null ? "" : error.optInt("code") + ": ") +
-          (error == null
-              ? parsed.get("error").toString()
-              : error.optString("message"))
-        );
-        return null;
+        Integer code = error != null && error.has("code")
+          ? error.optInt("code")
+          : null;
+        String message = error == null
+          ? parsed.get("error").toString()
+          : error.optString("message");
+        fileLogger.error("RPC " + method + " error " + code + ": " + message);
+        return RpcResponse.refused(code, message);
       }
 
       if (response.statusCode() != 200) {
         fileLogger.error(
           "RPC " + method + " to " + url + " returned " + response.statusCode()
         );
-        return null;
+        return RpcResponse.unreachable("HTTP " + response.statusCode());
       }
 
       if (parsed == null) {
         fileLogger.error("RPC " + method + " returned an unreadable body");
-        return null;
+        return RpcResponse.unreachable("unreadable body");
       }
 
-      return unwrap(parsed);
+      return RpcResponse.success(unwrap(parsed));
     } catch (Exception e) {
       fileLogger.error(
         "RPC " + method + " to " + url + " failed: " + e.getMessage()
       );
-      return null;
+      return RpcResponse.unreachable(String.valueOf(e.getMessage()));
     }
   }
 

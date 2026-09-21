@@ -18,6 +18,7 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import org.bson.types.ObjectId;
@@ -111,6 +112,16 @@ public class BitcoinChainAdapter implements ChainAdapter {
   private static final String ESTIMATE_MODE = "economical";
   private static final String ADDRESS_TYPE = "bech32";
 
+  /**
+   * Bitcoin Core RPC error codes. Note that {@code sendtoaddress} reports every
+   * transaction-building failure as -6 and {@code walletcreatefundedpsbt} as
+   * -4, each with the specific reason only in the message, so classification
+   * leans on the text.
+   */
+  static final int RPC_WALLET_ERROR = -4;
+  static final int RPC_INVALID_ADDRESS_OR_KEY = -5;
+  static final int RPC_WALLET_INSUFFICIENT_FUNDS = -6;
+
   private static final BigDecimal SATOSHIS_PER_BTC = BigDecimal.valueOf(
     100_000_000L
   );
@@ -178,6 +189,166 @@ public class BitcoinChainAdapter implements ChainAdapter {
   @Override
   public boolean supportsRepresentative() {
     return false;
+  }
+
+  /**
+   * Has the wallet fund the exact transaction a withdrawal would send, without
+   * signing or broadcasting it, and reports the fee it settled on.
+   *
+   * <p>{@code walletcreatefundedpsbt} runs the same coin selection and fee
+   * estimation as {@code sendtoaddress}, with the fee subtracted from the
+   * single output as the real send does. It locks nothing ({@code lockUnspents}
+   * defaults to false), so the real send later selects afresh.
+   */
+  @Override
+  public FeeQuote quoteWithdrawalFee(
+    CurrencyEntity currencyEntity,
+    String raw,
+    String address
+  ) {
+    BigInteger satoshis;
+    try {
+      satoshis = new BigInteger(raw);
+    } catch (NumberFormatException e) {
+      return FeeQuote.unavailable();
+    }
+
+    JSONArray outputs = new JSONArray()
+      .put(new JSONObject().put(address, toBitcoin(satoshis)));
+    JSONObject options = new JSONObject()
+      .put("subtractFeeFromOutputs", new JSONArray().put(0))
+      .put("conf_target", resolveConfirmationTarget(currencyEntity))
+      .put("estimate_mode", ESTIMATE_MODE)
+      .put("replaceable", false);
+
+    RpcResponse response = rpc.walletDetailed(
+      currencyEntity,
+      "walletcreatefundedpsbt",
+      new JSONArray(),
+      outputs,
+      0,
+      options
+    );
+
+    if (response.isSuccess()) {
+      BigInteger fee = toSatoshis(response.result().opt("fee"));
+      if (fee == null || fee.signum() <= 0) {
+        return FeeQuote.unavailable();
+      }
+      fileLogger.info(
+        "Quoted " +
+        currencyEntity.getTicker() +
+        " withdrawal of " +
+        raw +
+        ": fee " +
+        fee
+      );
+      return FeeQuote.quoted(fee);
+    }
+
+    WalletRefusal refusal = classifyRefusal(currencyEntity, response);
+    if (refusal.isTransient()) {
+      return FeeQuote.unavailable();
+    }
+    logOperatorConcern(currencyEntity, refusal, "fee quote for " + raw);
+    return FeeQuote.rejected(refusal);
+  }
+
+  /**
+   * Turns a failed wallet call into something the rest of the adapter can act
+   * on, with wording a user can be shown.
+   *
+   * <p>There is no lock to wait out on Bitcoin: Core spends its own unconfirmed
+   * change, and deposits are only credited once they are six blocks deep, so
+   * "insufficient funds" here is a real shortfall rather than a passing state.
+   */
+  WalletRefusal classifyRefusal(
+    CurrencyEntity currencyEntity,
+    RpcResponse response
+  ) {
+    WalletRefusal.Kind kind = response.isTransportFailure()
+      ? WalletRefusal.Kind.UNREACHABLE
+      : classifyCode(response.errorCode(), response.errorMessage());
+    String name = currencyEntity.getName();
+    return switch (kind) {
+      case FEE_EXCEEDS_AMOUNT -> new WalletRefusal(
+        kind,
+        "The network fee would exceed the amount requested, so the " +
+        "transaction could not be created.",
+        "The current minimum withdrawal, including network fees, is **" +
+        effectiveMinimum(currencyEntity) +
+        " " +
+        currencyEntity.getTicker() +
+        "**."
+      );
+      case INSUFFICIENT_FUNDS -> new WalletRefusal(
+        kind,
+        "The bot's " +
+        name +
+        " wallet does not have enough confirmed funds for this withdrawal " +
+        "right now.",
+        "Please try again later."
+      );
+      case ADDRESS_REJECTED -> new WalletRefusal(
+        kind,
+        "The " + name + " network rejected the destination address."
+      );
+      case UNREACHABLE -> new WalletRefusal(
+        kind,
+        "The bot's " + name + " wallet is not responding right now."
+      );
+      case FUNDS_LOCKED, TX_TOO_LARGE, OTHER -> new WalletRefusal(
+        WalletRefusal.Kind.OTHER,
+        "The bot's " + name + " wallet could not create this transaction."
+      );
+    };
+  }
+
+  static WalletRefusal.Kind classifyCode(Integer code, String message) {
+    String text = message == null ? "" : message.toLowerCase(Locale.ROOT);
+    if (code != null && code == RPC_INVALID_ADDRESS_OR_KEY) {
+      return WalletRefusal.Kind.ADDRESS_REJECTED;
+    }
+    if (text.contains("insufficient funds")) {
+      return WalletRefusal.Kind.INSUFFICIENT_FUNDS;
+    }
+    if (text.contains("too small") || text.contains("dust")) {
+      return WalletRefusal.Kind.FEE_EXCEEDS_AMOUNT;
+    }
+    if (text.contains("invalid") && text.contains("address")) {
+      return WalletRefusal.Kind.ADDRESS_REJECTED;
+    }
+    return WalletRefusal.Kind.OTHER;
+  }
+
+  private String effectiveMinimum(CurrencyEntity currencyEntity) {
+    return currenciesService.getCurrencyDecimalValue(
+      currenciesService.getEffectiveMinimumWithdraw(
+        new CurrencyDto(currencyEntity)
+      ),
+      Integer.parseInt(currencyEntity.getPrecision())
+    );
+  }
+
+  /**
+   * A shortfall means liabilities exceed what the hot wallet holds, which an
+   * operator has to look at; it is not something the user can fix.
+   */
+  private void logOperatorConcern(
+    CurrencyEntity currencyEntity,
+    WalletRefusal refusal,
+    String context
+  ) {
+    if (refusal.kind() == WalletRefusal.Kind.INSUFFICIENT_FUNDS) {
+      fileLogger.error(
+        currencyEntity.getTicker() +
+        " wallet refused a " +
+        context +
+        " with " +
+        refusal.kind() +
+        "; this needs attention."
+      );
+    }
   }
 
   // ------------------------------------------------------- deposit addresses
@@ -752,7 +923,7 @@ public class BitcoinChainAdapter implements ChainAdapter {
       );
     }
 
-    JSONObject result = rpc.wallet(
+    RpcResponse response = rpc.walletDetailed(
       currencyEntity,
       "sendtoaddress",
       queueEntity.getTargetAddress(),
@@ -770,11 +941,25 @@ public class BitcoinChainAdapter implements ChainAdapter {
       ESTIMATE_MODE
     );
 
-    String txid = result == null
-      ? null
-      : result.optString(BitcoinRpcClient.RESULT_KEY, null);
+    String txid = response.isSuccess()
+      ? response.result().optString(BitcoinRpcClient.RESULT_KEY, null)
+      : null;
     if (txid == null || txid.isBlank()) {
-      handleSendFailure(queueEntity, currencyEntity, commandMap);
+      WalletRefusal refusal = classifyRefusal(currencyEntity, response);
+      if (refusal.kind() == WalletRefusal.Kind.UNREACHABLE) {
+        // Not counted as an attempt: the send was never judged. The entry waits
+        // for the node to come back, as a brief outage must not cancel a good
+        // withdrawal.
+        fileLogger.warn(
+          "Could not reach the " +
+          currencyEntity.getTicker() +
+          " wallet for queue #" +
+          queueEntity.getId() +
+          "; will retry."
+        );
+        return;
+      }
+      handleSendFailure(queueEntity, currencyEntity, refusal, commandMap);
       return;
     }
 
@@ -906,10 +1091,11 @@ public class BitcoinChainAdapter implements ChainAdapter {
   }
 
   /**
-   * Counts a failed send attempt and, once attempts are exhausted, refunds the
-   * user rather than retrying forever.
+   * Counts a refused send attempt and, once attempts are exhausted, refunds the
+   * user with the wallet's reason rather than retrying forever.
    *
-   * <p>The common permanent failure is an amount that cannot survive the fee:
+   * <p>Only refusals reach here; a node that did not answer is not counted.
+   * The common permanent failure is an amount that cannot survive the fee:
    * with the fee deducted from the output, what is left falls under the dust
    * threshold and the node refuses to build the transaction. That fails
    * identically on every retry, and the balance was debited when the withdrawal
@@ -918,6 +1104,7 @@ public class BitcoinChainAdapter implements ChainAdapter {
   private void handleSendFailure(
     QueueEntity queueEntity,
     CurrencyEntity currencyEntity,
+    WalletRefusal refusal,
     Map<String, String> commandMap
   ) {
     int attempts =
@@ -936,7 +1123,9 @@ public class BitcoinChainAdapter implements ChainAdapter {
       currencyEntity.getTicker() +
       " withdrawal for queue #" +
       queueEntity.getId() +
-      " (attempt " +
+      " (" +
+      refusal.kind() +
+      ", attempt " +
       attempts +
       " of " +
       MAX_SEND_ATTEMPTS +
@@ -946,6 +1135,12 @@ public class BitcoinChainAdapter implements ChainAdapter {
     if (attempts < MAX_SEND_ATTEMPTS) {
       return;
     }
+
+    logOperatorConcern(
+      currencyEntity,
+      refusal,
+      "withdrawal for queue #" + queueEntity.getId()
+    );
 
     // Never refund without proving nothing reached the network, or the user
     // would be credited for a withdrawal they actually received.
@@ -979,26 +1174,7 @@ public class BitcoinChainAdapter implements ChainAdapter {
       return;
     }
 
-    String minimum = currenciesService.getCurrencyDecimalValue(
-      currenciesService.getEffectiveMinimumWithdraw(
-        new CurrencyDto(currencyEntity)
-      ),
-      Integer.parseInt(currencyEntity.getPrecision())
-    );
-
-    refund(
-      queueEntity,
-      currencyEntity,
-      "## Network fees exceeded the amount requested, so the transaction could " +
-      "not be created. Your funds were **not** sent and have been returned to " +
-      "your balance.\n" +
-      "-# The current minimum withdrawal, including network fees, is **" +
-      minimum +
-      " " +
-      currencyEntity.getTicker() +
-      "**.",
-      commandMap
-    );
+    refund(queueEntity, currencyEntity, refusal.refundMessage(), commandMap);
   }
 
   /**

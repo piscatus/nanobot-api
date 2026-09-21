@@ -1,7 +1,18 @@
 package com.nanobot.nanobotbackend.service.chain;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import com.nanobot.nanobotbackend.entity.CurrencyEntity;
+import com.nanobot.nanobotbackend.repository.DepositRecordsRepository;
+import com.nanobot.nanobotbackend.service.CurrenciesService;
+import com.nanobot.nanobotbackend.service.DepositAddressService;
+import com.nanobot.nanobotbackend.service.QueuesService;
 import com.nanobot.nanobotbackend.service.chain.BitcoinChainAdapter.Deposit;
 import java.math.BigInteger;
 import java.util.Map;
@@ -9,8 +20,192 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 class BitcoinChainAdapterTest {
+
+  // ----------------------------------------------------------- refusals
+
+  /**
+   * Bitcoin Core puts the real reason in the message and reuses one code per
+   * RPC method, so the text is what has to be read.
+   */
+  @Test
+  void refusalMessagesShouldMapToTheirKinds() {
+    assertEquals(
+      WalletRefusal.Kind.INSUFFICIENT_FUNDS,
+      BitcoinChainAdapter.classifyCode(-6, "Insufficient funds")
+    );
+    assertEquals(
+      WalletRefusal.Kind.INSUFFICIENT_FUNDS,
+      BitcoinChainAdapter.classifyCode(-4, "Insufficient funds")
+    );
+    assertEquals(
+      WalletRefusal.Kind.FEE_EXCEEDS_AMOUNT,
+      BitcoinChainAdapter.classifyCode(
+        -6,
+        "The transaction amount is too small to pay the fee"
+      )
+    );
+    assertEquals(
+      WalletRefusal.Kind.FEE_EXCEEDS_AMOUNT,
+      BitcoinChainAdapter.classifyCode(
+        -4,
+        "The transaction amount is too small to send after the fee has been deducted"
+      )
+    );
+    assertEquals(
+      WalletRefusal.Kind.FEE_EXCEEDS_AMOUNT,
+      BitcoinChainAdapter.classifyCode(-6, "Transaction amount too small")
+    );
+    assertEquals(
+      WalletRefusal.Kind.ADDRESS_REJECTED,
+      BitcoinChainAdapter.classifyCode(-5, "Invalid address")
+    );
+    assertEquals(
+      WalletRefusal.Kind.OTHER,
+      BitcoinChainAdapter.classifyCode(-4, "Fee exceeds maximum configured by user")
+    );
+    assertEquals(
+      WalletRefusal.Kind.OTHER,
+      BitcoinChainAdapter.classifyCode(null, null)
+    );
+  }
+
+  private static CurrencyEntity bitcoin() {
+    CurrencyEntity currency = new CurrencyEntity();
+    currency.setTicker("BTC");
+    currency.setName("Bitcoin");
+    currency.setPrecision("8");
+    currency.setFeePriority("2");
+    return currency;
+  }
+
+  private static BitcoinChainAdapter adapterWith(BitcoinRpcClient rpc) {
+    CurrenciesService currenciesService = mock(CurrenciesService.class);
+    when(currenciesService.getEffectiveMinimumWithdraw(any())).thenReturn("1");
+    when(currenciesService.getCurrencyDecimalValue(any(), anyInt()))
+      .thenReturn("0.00000001");
+    return new BitcoinChainAdapter(
+      rpc,
+      currenciesService,
+      mock(DepositAddressService.class),
+      mock(DepositRecordsRepository.class),
+      mock(DepositNoticeService.class),
+      mock(QueuesService.class)
+    );
+  }
+
+  /**
+   * The quote funds the same single-output, fee-subtracted transaction the
+   * real send would, at the same confirmation target, without locking any
+   * coins.
+   */
+  @Test
+  void quoteShouldFundThePsbtTheSendWouldUse() throws JSONException {
+    BitcoinRpcClient rpc = mock(BitcoinRpcClient.class);
+    CurrencyEntity currency = bitcoin();
+    when(
+      rpc.walletDetailed(
+        eq(currency),
+        eq("walletcreatefundedpsbt"),
+        any(),
+        any(),
+        any(),
+        any()
+      )
+    )
+      .thenReturn(
+        RpcResponse.success(
+          new JSONObject()
+            .put("psbt", "cHNidP8=")
+            .put("fee", "0.00001234")
+            .put("changepos", 1)
+        )
+      );
+
+    FeeQuote quote = adapterWith(rpc).quoteWithdrawalFee(
+      currency,
+      "150000",
+      "bc1qaaa"
+    );
+
+    assertEquals(FeeQuote.Status.QUOTED, quote.status());
+    assertEquals(BigInteger.valueOf(1234L), quote.fee());
+
+    ArgumentCaptor<Object> params = ArgumentCaptor.forClass(Object.class);
+    verify(rpc).walletDetailed(
+      eq(currency),
+      eq("walletcreatefundedpsbt"),
+      params.capture(),
+      params.capture(),
+      params.capture(),
+      params.capture()
+    );
+    JSONArray outputs = (JSONArray) params.getAllValues().get(1);
+    assertEquals("0.00150000", outputs.getJSONObject(0).getString("bc1qaaa"));
+    JSONObject options = (JSONObject) params.getAllValues().get(3);
+    assertEquals(0, options.getJSONArray("subtractFeeFromOutputs").getInt(0));
+    assertEquals(6, options.getInt("conf_target"));
+    assertFalse(options.getBoolean("replaceable"));
+    assertFalse(options.has("lockUnspents"));
+  }
+
+  @Test
+  void quoteShouldRejectAnAmountTooSmallForTheFee() {
+    BitcoinRpcClient rpc = mock(BitcoinRpcClient.class);
+    CurrencyEntity currency = bitcoin();
+    when(
+      rpc.walletDetailed(
+        eq(currency),
+        eq("walletcreatefundedpsbt"),
+        any(),
+        any(),
+        any(),
+        any()
+      )
+    )
+      .thenReturn(
+        RpcResponse.refused(
+          -4,
+          "The transaction amount is too small to send after the fee has been deducted"
+        )
+      );
+
+    FeeQuote quote = adapterWith(rpc).quoteWithdrawalFee(
+      currency,
+      "500",
+      "bc1qaaa"
+    );
+
+    assertEquals(FeeQuote.Status.REJECTED, quote.status());
+    assertEquals(
+      WalletRefusal.Kind.FEE_EXCEEDS_AMOUNT,
+      quote.refusal().kind()
+    );
+  }
+
+  @Test
+  void quoteShouldTreatAnUnreachableNodeAsUnavailable() {
+    BitcoinRpcClient rpc = mock(BitcoinRpcClient.class);
+    CurrencyEntity currency = bitcoin();
+    when(
+      rpc.walletDetailed(
+        eq(currency),
+        eq("walletcreatefundedpsbt"),
+        any(),
+        any(),
+        any(),
+        any()
+      )
+    )
+      .thenReturn(RpcResponse.unreachable("connection refused"));
+
+    assertEquals(
+      FeeQuote.Status.UNAVAILABLE,
+      adapterWith(rpc).quoteWithdrawalFee(currency, "150000", "bc1qaaa").status()
+    );
+  }
 
   // ------------------------------------------------------- derivation index
 
