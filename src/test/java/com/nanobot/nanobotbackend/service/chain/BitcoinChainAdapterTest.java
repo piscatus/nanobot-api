@@ -230,6 +230,61 @@ class BitcoinChainAdapterTest {
   }
 
   @Test
+  void liveMinimumShouldFundAtLeastDustWhenTheRequestedOutputIsSmaller()
+    throws JSONException {
+    BitcoinRpcClient rpc = mock(BitcoinRpcClient.class);
+    CurrencyEntity currency = bitcoin();
+    CurrenciesService currenciesService = mock(CurrenciesService.class);
+    when(currenciesService.getCurrencyDecimalValue("435", 8))
+      .thenReturn("0.00000435");
+    BitcoinChainAdapter adapter = new BitcoinChainAdapter(
+      rpc,
+      currenciesService,
+      mock(DepositAddressService.class),
+      mock(DepositRecordsRepository.class),
+      mock(DepositNoticeService.class),
+      mock(QueuesService.class)
+    );
+    when(
+      rpc.walletDetailed(
+        eq(currency),
+        eq("walletcreatefundedpsbt"),
+        any(),
+        any(),
+        any(),
+        any()
+      )
+    )
+      .thenReturn(
+        RpcResponse.refused(
+          -4,
+          "The transaction amount is too small to send after the fee has been deducted"
+        )
+      )
+      .thenReturn(
+        RpcResponse.success(new JSONObject().put("fee", "0.00000141"))
+      );
+
+    FeeQuote quote = adapter.quoteWithdrawalFee(currency, "269", "bc1qaaa");
+
+    assertEquals(FeeQuote.Status.REJECTED, quote.status());
+    assertTrue(quote.refusal().hint().contains("0.00000435 BTC"));
+    ArgumentCaptor<Object> params = ArgumentCaptor.forClass(Object.class);
+    verify(rpc, org.mockito.Mockito.times(2)).walletDetailed(
+      eq(currency),
+      eq("walletcreatefundedpsbt"),
+      params.capture(),
+      params.capture(),
+      params.capture(),
+      params.capture()
+    );
+    JSONObject secondOptions = (JSONObject) params.getAllValues().get(7);
+    assertFalse(secondOptions.has("subtractFeeFromOutputs"));
+    JSONArray secondOutputs = (JSONArray) params.getAllValues().get(5);
+    assertEquals("0.00000294", secondOutputs.getJSONObject(0).getString("bc1qaaa"));
+  }
+
+  @Test
   void quoteShouldOmitAMinimumWhenTheLiveFeeCannotBeMeasured() {
     BitcoinRpcClient rpc = mock(BitcoinRpcClient.class);
     CurrencyEntity currency = bitcoin();

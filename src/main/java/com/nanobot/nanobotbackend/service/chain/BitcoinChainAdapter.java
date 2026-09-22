@@ -350,8 +350,13 @@ public class BitcoinChainAdapter implements ChainAdapter {
       return null;
     }
 
+    // The requested amount may itself be under dust. Funding that output
+    // without subtracting the fee still fails, so we never learn the fee.
+    // Ask for at least a relayable output; vsize (and thus the fee) is the
+    // same as the withdrawal they tried.
+    BigInteger funded = satoshis.max(P2WPKH_DUST);
     JSONArray outputs = new JSONArray()
-      .put(new JSONObject().put(address, toBitcoin(satoshis)));
+      .put(new JSONObject().put(address, toBitcoin(funded)));
     JSONObject options = new JSONObject()
       .put("conf_target", resolveConfirmationTarget(currencyEntity))
       .put("estimate_mode", ESTIMATE_MODE)
