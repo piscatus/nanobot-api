@@ -49,6 +49,12 @@ public class QueueEntity extends BaseEntity {
   /** Failed on-chain submissions for this entry. */
   private Integer attempts;
 
+  /**
+   * Destination index in a combined Monero transfer, so each queued send can
+   * credit and announce its own output when several pay the same address.
+   */
+  private Integer destIndex;
+
   public QueueEntity() {
     super();
   }
@@ -70,6 +76,7 @@ public class QueueEntity extends BaseEntity {
     this.timestamp = queue.getTimestamp();
     this.transactionId = queue.getTransactionId();
     this.attempts = queue.getAttempts();
+    this.destIndex = queue.getDestIndex();
   }
 
   public Integer getAttempts() {
@@ -78,6 +85,14 @@ public class QueueEntity extends BaseEntity {
 
   public void setAttempts(Integer attempts) {
     this.attempts = attempts;
+  }
+
+  public Integer getDestIndex() {
+    return destIndex;
+  }
+
+  public void setDestIndex(Integer destIndex) {
+    this.destIndex = destIndex;
   }
 
   public String getTransactionId() {

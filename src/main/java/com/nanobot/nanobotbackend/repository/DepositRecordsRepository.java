@@ -19,4 +19,11 @@ public interface DepositRecordsRepository
     String txid,
     Long addressIndex
   );
+
+  boolean existsByTickerAndTxidAndAddressIndexAndOutputIndex(
+    String ticker,
+    String txid,
+    Long addressIndex,
+    Long outputIndex
+  );
 }

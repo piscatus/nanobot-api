@@ -2,15 +2,20 @@ package com.nanobot.nanobotbackend.service.chain;
 
 import com.nanobot.nanobotbackend.entity.CurrencyEntity;
 import com.nanobot.nanobotbackend.task.FileLogger;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
-import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -21,26 +26,22 @@ import org.springframework.stereotype.Component;
  * JSON-RPC client for monero-wallet-rpc and monerod.
  *
  * <p>Implements HTTP Digest authentication by hand. monero-wallet-rpc only
- * offers digest, never basic, and the JDK's HttpClient supports basic only, so
- * the alternatives were this or an extra HTTP dependency.
+ * offers digest, never basic, and the JDK's HttpClient supports basic only.
+ * The wallet also binds the digest nonce to the TCP connection, so the
+ * challenge and the authenticated retry have to share one socket. Two
+ * separate client calls open two connections and the retry is refused.
  */
 @Component
 public class MoneroWalletRpcClient {
 
   private static final String JSON_RPC_PATH = "/json_rpc";
+  private static final int CONNECT_TIMEOUT_MS = 10_000;
+  private static final int READ_TIMEOUT_MS = 60_000;
 
-  private final HttpClient client;
   private final FileLogger fileLogger;
   private final SecureRandom random = new SecureRandom();
 
   public MoneroWalletRpcClient() {
-    this(
-      HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
-    );
-  }
-
-  MoneroWalletRpcClient(HttpClient client) {
-    this.client = client;
     this.fileLogger = new FileLogger("MoneroWalletRpcClient");
   }
 
@@ -127,14 +128,14 @@ public class MoneroWalletRpcClient {
     if (params != null) {
       body.put("params", params);
     }
-    try {
-      HttpResponse<String> response = send(url, body, null);
+    byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
+    try (Socket socket = open(url)) {
+      RawHttp response = exchange(socket, URI.create(url), payload, null);
 
-      if (response.statusCode() == 401 && user != null) {
-        String challenge = response
-          .headers()
-          .firstValue("WWW-Authenticate")
-          .orElse(null);
+      if (response.status == 401 && user != null) {
+        String challenge = selectChallenge(
+          response.headers.get("www-authenticate")
+        );
         if (challenge == null) {
           fileLogger.error("401 from " + url + " without a digest challenge");
           return RpcResponse.unreachable("401 without a digest challenge");
@@ -149,17 +150,19 @@ public class MoneroWalletRpcClient {
         if (authorization == null) {
           return RpcResponse.unreachable("unusable digest challenge");
         }
-        response = send(url, body, authorization);
+        // Same socket. The wallet's nonce is only valid on the connection
+        // that issued it.
+        response = exchange(socket, URI.create(url), payload, authorization);
       }
 
-      if (response.statusCode() != 200) {
+      if (response.status != 200) {
         fileLogger.error(
-          "RPC " + method + " to " + url + " returned " + response.statusCode()
+          "RPC " + method + " to " + url + " returned " + response.status
         );
-        return RpcResponse.unreachable("HTTP " + response.statusCode());
+        return RpcResponse.unreachable("HTTP " + response.status);
       }
 
-      JSONObject parsed = new JSONObject(response.body());
+      JSONObject parsed = new JSONObject(response.body);
       if (parsed.has("error")) {
         JSONObject error = parsed.getJSONObject("error");
         Integer code = error.has("code") ? error.optInt("code") : null;
@@ -181,21 +184,129 @@ public class MoneroWalletRpcClient {
     }
   }
 
-  private HttpResponse<String> send(
-    String url,
-    JSONObject body,
-    String authorization
-  ) throws Exception {
-    HttpRequest.Builder builder = HttpRequest.newBuilder()
-      .uri(URI.create(url))
-      .timeout(Duration.ofSeconds(60))
-      .header("Content-Type", "application/json")
-      .POST(HttpRequest.BodyPublishers.ofString(body.toString()));
-    if (authorization != null) {
-      builder.header("Authorization", authorization);
+  /**
+   * monero-wallet-rpc advertises MD5 and MD5-sess. MD5 is the one curl and
+   * the wallet agree on; MD5-sess is rejected in practice.
+   */
+  static String selectChallenge(List<String> challenges) {
+    if (challenges == null || challenges.isEmpty()) {
+      return null;
     }
-    return client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+    String fallback = null;
+    for (String challenge : challenges) {
+      if (challenge == null || challenge.isBlank()) {
+        continue;
+      }
+      String algorithm = parseChallenge(challenge).getOrDefault(
+        "algorithm",
+        "MD5"
+      );
+      if ("MD5".equalsIgnoreCase(algorithm)) {
+        return challenge;
+      }
+      if (fallback == null) {
+        fallback = challenge;
+      }
+    }
+    return fallback;
   }
+
+  private Socket open(String url) throws IOException {
+    URI uri = URI.create(url);
+    int port = uri.getPort();
+    if (port < 0) {
+      port = "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
+    }
+    Socket socket = new Socket();
+    socket.connect(new InetSocketAddress(uri.getHost(), port), CONNECT_TIMEOUT_MS);
+    socket.setSoTimeout(READ_TIMEOUT_MS);
+    return socket;
+  }
+
+  private RawHttp exchange(
+    Socket socket,
+    URI uri,
+    byte[] payload,
+    String authorization
+  ) throws IOException {
+    String path = uri.getRawPath();
+    if (path == null || path.isEmpty()) {
+      path = "/";
+    }
+    if (uri.getRawQuery() != null) {
+      path = path + "?" + uri.getRawQuery();
+    }
+    int port = uri.getPort();
+    String host = uri.getHost() + (port > 0 ? ":" + port : "");
+    StringBuilder headers = new StringBuilder();
+    headers.append("POST ").append(path).append(" HTTP/1.1\r\n");
+    headers.append("Host: ").append(host).append("\r\n");
+    headers.append("Content-Type: application/json\r\n");
+    headers.append("Connection: keep-alive\r\n");
+    headers.append("Content-Length: ").append(payload.length).append("\r\n");
+    if (authorization != null) {
+      headers.append("Authorization: ").append(authorization).append("\r\n");
+    }
+    headers.append("\r\n");
+    OutputStream out = socket.getOutputStream();
+    out.write(headers.toString().getBytes(StandardCharsets.US_ASCII));
+    out.write(payload);
+    out.flush();
+    return readHttp(socket.getInputStream());
+  }
+
+  private RawHttp readHttp(InputStream in) throws IOException {
+    ByteArrayOutputStream headerBytes = new ByteArrayOutputStream();
+    int matched = 0;
+    while (matched < 4) {
+      int next = in.read();
+      if (next < 0) {
+        throw new IOException("connection closed before headers");
+      }
+      headerBytes.write(next);
+      if (next == "\r\n\r\n".charAt(matched)) {
+        matched++;
+      } else {
+        matched = next == '\r' ? 1 : 0;
+      }
+      if (headerBytes.size() > 65_536) {
+        throw new IOException("response headers too large");
+      }
+    }
+    String headerText = headerBytes.toString(StandardCharsets.ISO_8859_1);
+    String[] lines = headerText.split("\r\n");
+    String[] statusParts = lines[0].split(" ");
+    if (statusParts.length < 2) {
+      throw new IOException("unreadable status line");
+    }
+    int status = Integer.parseInt(statusParts[1]);
+    Map<String, List<String>> headers = new HashMap<>();
+    for (int i = 1; i < lines.length; i++) {
+      int colon = lines[i].indexOf(':');
+      if (colon < 0) {
+        continue;
+      }
+      String name = lines[i].substring(0, colon).trim().toLowerCase(Locale.ROOT);
+      String value = lines[i].substring(colon + 1).trim();
+      headers.computeIfAbsent(name, key -> new ArrayList<>()).add(value);
+    }
+    int length = 0;
+    List<String> contentLength = headers.get("content-length");
+    if (contentLength != null && !contentLength.isEmpty()) {
+      length = Integer.parseInt(contentLength.get(0).trim());
+    }
+    byte[] body = in.readNBytes(length);
+    if (body.length != length) {
+      throw new IOException("response body ended early");
+    }
+    return new RawHttp(status, headers, new String(body, StandardCharsets.UTF_8));
+  }
+
+  private record RawHttp(
+    int status,
+    Map<String, List<String>> headers,
+    String body
+  ) {}
 
   String buildDigestHeader(
     String challenge,

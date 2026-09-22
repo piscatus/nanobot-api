@@ -6,9 +6,12 @@ import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
 /**
- * A "deposit discovered" notice that has already been sent, so the user is
- * told once about an incoming transaction rather than on every scan while it
- * waits for confirmations.
+ * The incoming-deposit notice lifecycle for one (ticker, txid, addressIndex).
+ *
+ * <p>A row means the deposit has been announced as discovered. {@code
+ * confirmedAt} set means the follow-up "credited" notice has gone out too.
+ * Both flags are write-once so a scan can re-see the same transaction forever
+ * without repeating either message.
  *
  * <p>Deliberately separate from {@code depositRecords}. That collection is the
  * exactly-once guard for crediting, and a row there means money moved; mixing
@@ -50,6 +53,9 @@ public class DepositNoticeEntity extends BaseEntity {
 
   @Indexed(name = "timestamp_ttl", expireAfter = "14d")
   private Date timestamp;
+
+  /** Set once the Deposit Confirmed notice has been written. */
+  private Date confirmedAt;
 
   public DepositNoticeEntity() {
     super();
@@ -117,5 +123,13 @@ public class DepositNoticeEntity extends BaseEntity {
 
   public void setTimestamp(Date timestamp) {
     this.timestamp = timestamp;
+  }
+
+  public Date getConfirmedAt() {
+    return confirmedAt;
+  }
+
+  public void setConfirmedAt(Date confirmedAt) {
+    this.confirmedAt = confirmedAt;
   }
 }

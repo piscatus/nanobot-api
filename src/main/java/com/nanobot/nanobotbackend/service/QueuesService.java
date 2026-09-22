@@ -54,5 +54,18 @@ public interface QueuesService {
     Boolean processed
   );
 
+  /**
+   * Same as {@link #updateQueueProgress(String, Integer, Long, String, Boolean)}
+   * with an optional destination index for a combined Monero send.
+   */
+  boolean updateQueueProgress(
+    String id,
+    Integer attempts,
+    Long index,
+    String blockHash,
+    Boolean processed,
+    Integer destIndex
+  );
+
   Optional<QueueEntity> deleteQueue(String id);
 }

@@ -5,6 +5,9 @@ import com.nanobot.nanobotbackend.repository.DepositNoticesRepository;
 import com.nanobot.nanobotbackend.task.FileLogger;
 import jakarta.annotation.PostConstruct;
 import java.time.Duration;
+import java.util.Date;
+import java.util.List;
+import java.util.Optional;
 import org.bson.types.ObjectId;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.domain.Sort;
@@ -14,9 +17,9 @@ import org.springframework.data.mongodb.core.index.IndexOperations;
 import org.springframework.stereotype.Service;
 
 /**
- * Remembers which incoming deposits have already been announced as discovered,
- * so the announcement goes out exactly once per deposit however many times the
- * scan sees the transaction before it confirms.
+ * Remembers which deposits have already been announced as discovered and as
+ * confirmed, so each message goes out exactly once however many times the
+ * scan sees the transaction.
  */
 @Service
 public class DepositNoticeService {
@@ -122,6 +125,85 @@ public class DepositNoticeService {
     } catch (DuplicateKeyException e) {
       return false;
     }
+    return true;
+  }
+
+  /**
+   * True when this deposit has already been announced as discovered. Used by
+   * the scanner's confirm-notice recovery so a historical credit that never
+   * entered the discovery lifecycle is not announced as confirmed years later.
+   */
+  public boolean wasDiscovered(String ticker, String txid, Long addressIndex) {
+    return depositNoticesRepository.existsByTickerAndTxidAndAddressIndex(
+      ticker,
+      txid,
+      addressIndex
+    );
+  }
+
+  /**
+   * Discovery rows that still owe Deposit Confirmed. Used after the last
+   * withdrawal on a transaction is gone, so a skipped confirm is not lost.
+   */
+  public List<DepositNoticeEntity> unconfirmed(String ticker) {
+    if (ticker == null) {
+      return List.of();
+    }
+    List<DepositNoticeEntity> notices =
+      depositNoticesRepository.findByTickerAndConfirmedAtIsNull(ticker);
+    return notices == null ? List.of() : notices;
+  }
+
+  /**
+   * Records that the Deposit Confirmed notice has been sent. Returns true only
+   * for the first time, which is the caller's cue to write the message.
+   *
+   * <p>Creates the row if discovery never did, so a confirm-only path (a
+   * self-send first seen after it matured) is still exactly-once.
+   */
+  public boolean recordConfirmSent(
+    String ticker,
+    String txid,
+    Long addressIndex,
+    String userId,
+    String raw
+  ) {
+    Optional<DepositNoticeEntity> existing =
+      depositNoticesRepository.findByTickerAndTxidAndAddressIndex(
+        ticker,
+        txid,
+        addressIndex
+      );
+    if (existing.isPresent()) {
+      return markConfirmed(existing.get());
+    }
+
+    DepositNoticeEntity notice = new DepositNoticeEntity(
+      ticker,
+      txid,
+      addressIndex,
+      userId,
+      raw
+    );
+    notice.setId(new ObjectId().toHexString());
+    notice.setConfirmedAt(new Date());
+    try {
+      depositNoticesRepository.insert(notice);
+    } catch (DuplicateKeyException e) {
+      return depositNoticesRepository
+        .findByTickerAndTxidAndAddressIndex(ticker, txid, addressIndex)
+        .map(this::markConfirmed)
+        .orElse(false);
+    }
+    return true;
+  }
+
+  private boolean markConfirmed(DepositNoticeEntity notice) {
+    if (notice.getConfirmedAt() != null) {
+      return false;
+    }
+    notice.setConfirmedAt(new Date());
+    depositNoticesRepository.save(notice);
     return true;
   }
 }

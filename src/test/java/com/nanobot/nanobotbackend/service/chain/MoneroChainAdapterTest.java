@@ -2,7 +2,9 @@ package com.nanobot.nanobotbackend.service.chain;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
@@ -11,6 +13,9 @@ import static org.mockito.Mockito.*;
 
 import com.nanobot.nanobotbackend.dto.LevelDto;
 import com.nanobot.nanobotbackend.entity.CurrencyEntity;
+import com.nanobot.nanobotbackend.entity.DepositAddressEntity;
+import com.nanobot.nanobotbackend.entity.DepositNoticeEntity;
+import com.nanobot.nanobotbackend.entity.DepositRecordEntity;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;
 import com.nanobot.nanobotbackend.repository.DepositRecordsRepository;
@@ -20,19 +25,27 @@ import com.nanobot.nanobotbackend.service.QueuesService;
 import com.nanobot.nanobotbackend.util.Constants;
 import java.lang.reflect.Field;
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
+import org.springframework.dao.DuplicateKeyException;
 
 class MoneroChainAdapterTest {
 
   private MoneroWalletRpcClient rpc;
   private CurrenciesService currenciesService;
+  private DepositAddressService depositAddressService;
+  private DepositRecordsRepository depositRecordsRepository;
   private QueuesService queuesService;
   private ChainLedgerService chainLedgerService;
+  private DepositNoticeService depositNoticeService;
   private MoneroChainAdapter adapter;
   private CurrencyEntity currency;
   private QueueEntity queue;
@@ -41,14 +54,32 @@ class MoneroChainAdapterTest {
   void setUp() throws Exception {
     rpc = mock(MoneroWalletRpcClient.class);
     currenciesService = mock(CurrenciesService.class);
+    depositAddressService = mock(DepositAddressService.class);
+    depositRecordsRepository = mock(DepositRecordsRepository.class);
     queuesService = mock(QueuesService.class);
     chainLedgerService = mock(ChainLedgerService.class);
+    depositNoticeService = mock(DepositNoticeService.class);
+    when(
+      depositNoticeService.recordFirstSighting(
+        any(),
+        any(),
+        any(),
+        any(),
+        any()
+      )
+    )
+      .thenReturn(true);
+    when(
+      depositNoticeService.recordConfirmSent(any(), any(), any(), any(), any())
+    )
+      .thenReturn(true);
+    when(depositNoticeService.unconfirmed(any())).thenReturn(List.of());
     adapter = new MoneroChainAdapter(
       rpc,
       currenciesService,
-      mock(DepositAddressService.class),
-      mock(DepositRecordsRepository.class),
-      mock(DepositNoticeService.class),
+      depositAddressService,
+      depositRecordsRepository,
+      depositNoticeService,
       queuesService
     );
     Field ledger = MoneroChainAdapter.class.getDeclaredField(
@@ -131,6 +162,64 @@ class MoneroChainAdapterTest {
         raw(30700000L)
       )
     );
+  }
+
+  @Test
+  void shouldMatchADestinationThatPaidAShareOfACombinedFee() {
+    assertTrue(
+      MoneroChainAdapter.matchesQueuedAmount(
+        raw(100000000L),
+        raw(84650000L),
+        raw(30700000L)
+      )
+    );
+  }
+
+  @Test
+  void resolveDestinationAmountShouldSumEveryOutputToTheSameAddress()
+    throws Exception {
+    JSONObject transfer = new JSONObject()
+      .put(
+        "destinations",
+        new org.json.JSONArray()
+          .put(
+            new JSONObject()
+              .put("address", "8abc")
+              .put("amount", 185353333L)
+          )
+          .put(
+            new JSONObject()
+              .put("address", "8abc")
+              .put("amount", 185353333L)
+          )
+          .put(
+            new JSONObject()
+              .put("address", "8abc")
+              .put("amount", 135353334L)
+          )
+      );
+    assertEquals(
+      raw(506060000L),
+      MoneroChainAdapter.resolveDestinationAmount(transfer, "8abc")
+    );
+  }
+
+  @Test
+  void splitFeeShouldGiveEqualSharesWithRemainderOnTheLast() {
+    List<BigInteger> shares = MoneroChainAdapter.splitFee(raw(30700000L), 2);
+    assertEquals(List.of(raw(15350000L), raw(15350000L)), shares);
+    assertEquals(
+      List.of(raw(10L), raw(10L), raw(11L)),
+      MoneroChainAdapter.splitFee(raw(31L), 3)
+    );
+  }
+
+  @Test
+  void splitFeeShouldLeaveNoticesBlankWhenTheFeeIsMissing() {
+    List<BigInteger> shares = MoneroChainAdapter.splitFee(null, 2);
+    assertEquals(2, shares.size());
+    assertNull(shares.get(0));
+    assertNull(shares.get(1));
   }
 
   /** Accepted too, so the check does not depend on the fee being subtracted. */
@@ -282,18 +371,17 @@ class MoneroChainAdapterTest {
   }
 
   /**
-   * Locked funds are the queue processor's business: it waits them out, so the
-   * confirmation should go ahead with the estimate rather than refuse.
+   * Locked funds can still be sent once they unlock, but the user has to choose
+   * that wait. The quote is delayed rather than a refusal or a silent queue.
    */
   @Test
-  void quoteShouldTreatLockedFundsAsUnavailable() {
+  void quoteShouldTreatLockedFundsAsDelayed() {
     when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
       .thenReturn(RpcResponse.refused(-37, "not enough unlocked money"));
 
-    assertEquals(
-      FeeQuote.Status.UNAVAILABLE,
-      adapter.quoteWithdrawalFee(currency, "1000000000", "4abc").status()
-    );
+    FeeQuote quote = adapter.quoteWithdrawalFee(currency, "1000000000", "4abc");
+    assertEquals(FeeQuote.Status.DELAYED, quote.status());
+    assertEquals(WalletRefusal.Kind.FUNDS_LOCKED, quote.refusal().kind());
   }
 
   @Test
@@ -423,6 +511,708 @@ class MoneroChainAdapterTest {
     verify(chainLedgerService, never())
       .refundFailedWithdrawal(any(), any(), anyString(), any());
     verify(queuesService, never()).deleteQueue(anyString());
+  }
+
+  private QueueEntity secondQueue() {
+    QueueEntity other = new QueueEntity();
+    other.setId("q2");
+    other.setUserId("u2");
+    other.setLevel(LevelDto.SEND);
+    other.setProcessed(false);
+    other.setRaw("2000000000");
+    other.setTargetAddress("8xyz");
+    other.setTicker("XMR");
+    return other;
+  }
+
+  private static DepositAddressEntity selfSendOwner() {
+    return new DepositAddressEntity("u1", "XMR", "8abc", 3L);
+  }
+
+  private static QueueEntity confirmedSelfSend(String id, String raw) {
+    QueueEntity entry = new QueueEntity();
+    entry.setId(id);
+    entry.setUserId("u1");
+    entry.setLevel(LevelDto.SEND);
+    entry.setProcessed(true);
+    entry.setBlockHash("combo");
+    entry.setRaw(raw);
+    entry.setTargetAddress("8abc");
+    entry.setTicker("XMR");
+    return entry;
+  }
+
+  private static JSONObject combinedSelfSendTransfer() throws Exception {
+    return new JSONObject()
+      .put("confirmations", 10)
+      .put("height", 100)
+      .put("fee", 43940000L)
+      .put(
+        "destinations",
+        new org.json.JSONArray()
+          .put(
+            new JSONObject()
+              .put("address", "8abc")
+              .put("amount", 185353333L)
+          )
+          .put(
+            new JSONObject()
+              .put("address", "8abc")
+              .put("amount", 185353333L)
+          )
+          .put(
+            new JSONObject()
+              .put("address", "8abc")
+              .put("amount", 135353334L)
+          )
+      );
+  }
+
+  /**
+   * Two withdrawals waiting on the same locked change must not take a 10-block
+   * turn each. They are offered as one transfer, and when that is also locked
+   * they both wait for the next block instead of the first one sending and
+   * re-locking the change under the second.
+   */
+  @Test
+  void lockedFundsShouldDeferEveryWaitingSendTogether() throws Exception {
+    QueueEntity other = secondQueue();
+    when(queuesService.getQueuesByTicker("XMR")).thenReturn(List.of(queue, other));
+    daemonAt(100L);
+    when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
+      .thenReturn(RpcResponse.refused(-37, "not enough unlocked money"));
+
+    pass();
+
+    ArgumentCaptor<JSONObject> params = ArgumentCaptor.forClass(
+      JSONObject.class
+    );
+    verify(rpc, times(2)).walletDetailed(eq(currency), eq("transfer"), params.capture());
+    assertEquals(2, params.getAllValues().get(0).getJSONArray("destinations").length());
+    assertEquals(1, params.getAllValues().get(1).getJSONArray("destinations").length());
+    verify(chainLedgerService).notifyWithdrawalDelayed(
+      eq(currency),
+      eq(queue),
+      anyString(),
+      any()
+    );
+    verify(chainLedgerService).notifyWithdrawalDelayed(
+      eq(currency),
+      eq(other),
+      anyString(),
+      any()
+    );
+    assertFalse(queue.getProcessed());
+    assertFalse(other.getProcessed());
+  }
+
+  /**
+   * Once the change unlocks, both waiting withdrawals go out in the same
+   * transaction so neither sits behind the other's new lock.
+   */
+  @Test
+  void waitingSendsShouldBroadcastTogetherOnceFundsUnlock() throws Exception {
+    QueueEntity other = secondQueue();
+    when(queuesService.getQueuesByTicker("XMR")).thenReturn(List.of(queue, other));
+    daemonAt(100L, 101L);
+    when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
+      .thenReturn(RpcResponse.refused(-37, "not enough unlocked money"))
+      .thenReturn(RpcResponse.refused(-37, "not enough unlocked money"))
+      .thenReturn(
+        RpcResponse.success(
+          new JSONObject().put("tx_hash", "combo").put("fee", 30700000L)
+        )
+      );
+
+    pass();
+    pass();
+
+    assertEquals("combo", queue.getBlockHash());
+    assertEquals("combo", other.getBlockHash());
+    assertTrue(queue.getProcessed());
+    assertTrue(other.getProcessed());
+    ArgumentCaptor<JSONObject> params = ArgumentCaptor.forClass(
+      JSONObject.class
+    );
+    verify(rpc, times(3)).walletDetailed(eq(currency), eq("transfer"), params.capture());
+    JSONObject combined = params.getAllValues().get(2);
+    assertEquals(2, combined.getJSONArray("destinations").length());
+    assertEquals(2, combined.getJSONArray("subtract_fee_from_outputs").length());
+    verify(chainLedgerService)
+      .notifyWithdrawalSent(eq(currency), eq(queue), anyInt(), any(), eq(raw(15350000L)));
+    verify(chainLedgerService)
+      .notifyWithdrawalSent(eq(currency), eq(other), anyInt(), any(), eq(raw(15350000L)));
+  }
+
+  /**
+   * If the unlocked output covers the oldest withdrawal but not the pair, send
+   * the one that fits and leave the rest waiting. Do not hold the first user
+   * hostage to a later request the wallet cannot fund yet.
+   */
+  @Test
+  void combinedSendShouldShrinkToTheOldestPrefixTheWalletCanFund()
+    throws Exception {
+    QueueEntity other = secondQueue();
+    when(queuesService.getQueuesByTicker("XMR")).thenReturn(List.of(queue, other));
+    daemonAt(100L);
+    when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
+      .thenReturn(RpcResponse.refused(-37, "not enough unlocked money"))
+      .thenReturn(
+        RpcResponse.success(
+          new JSONObject().put("tx_hash", "solo").put("fee", 30700000L)
+        )
+      )
+      .thenReturn(RpcResponse.refused(-37, "not enough unlocked money"));
+
+    pass();
+
+    assertEquals("solo", queue.getBlockHash());
+    assertTrue(queue.getProcessed());
+    assertNull(other.getBlockHash());
+    assertFalse(other.getProcessed());
+    verify(chainLedgerService)
+      .notifyWithdrawalDelayed(eq(currency), eq(other), anyString(), any());
+  }
+
+  /**
+   * A combined self-send is one deposit. That notice must follow every
+   * Withdrawal Confirmed for the same transaction, not land between them.
+   */
+  @Test
+  void combinedSelfSendShouldAnnounceDepositAfterEveryWithdrawal()
+    throws Exception {
+    QueueEntity first = confirmedSelfSend("q1", "200000000");
+    QueueEntity second = confirmedSelfSend("q2", "200000000");
+    QueueEntity third = confirmedSelfSend("q3", "150000000");
+    List<QueueEntity> live = new ArrayList<>(List.of(first, second, third));
+    when(queuesService.getQueuesByTicker("XMR"))
+      .thenAnswer(invocation -> List.copyOf(live));
+    when(queuesService.deleteQueue(anyString()))
+      .thenAnswer(invocation -> {
+        String id = invocation.getArgument(0);
+        return live
+          .stream()
+          .filter(entry -> id.equals(entry.getId()))
+          .findFirst()
+          .map(entry -> {
+            live.remove(entry);
+            return entry;
+          });
+      });
+    DepositAddressEntity owner = new DepositAddressEntity(
+      "u1",
+      "XMR",
+      "8abc",
+      3L
+    );
+    when(depositAddressService.getByAddress("XMR", "8abc"))
+      .thenReturn(Optional.of(owner));
+    DepositRecordEntity booked = new DepositRecordEntity(
+      "XMR",
+      "combo",
+      3L,
+      "u1",
+      "506060000",
+      "100"
+    );
+    booked.setTransactionId("t1");
+    when(
+      depositRecordsRepository.findByTickerAndTxidAndAddressIndex(
+        "XMR",
+        "combo",
+        3L
+      )
+    )
+      .thenReturn(
+        Optional.empty(),
+        Optional.empty(),
+        Optional.of(booked),
+        Optional.of(booked)
+      );
+    when(
+      chainLedgerService.creditDeposit(
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        eq(false)
+      )
+    )
+      .thenReturn("t1");
+    daemonAt(100L);
+    when(rpc.wallet(eq(currency), eq("get_transfer_by_txid"), any()))
+      .thenReturn(
+        new JSONObject().put("transfer", combinedSelfSendTransfer())
+      );
+
+    pass();
+
+    InOrder order = inOrder(chainLedgerService);
+    order
+      .verify(chainLedgerService)
+      .notifyWithdrawalConfirmed(eq(currency), eq(first), any(), any());
+    order
+      .verify(chainLedgerService)
+      .notifyWithdrawalConfirmed(eq(currency), eq(second), any(), any());
+    order
+      .verify(chainLedgerService)
+      .notifyWithdrawalConfirmed(eq(currency), eq(third), any(), any());
+    order
+      .verify(chainLedgerService)
+      .notifyDepositConfirmed(
+        eq(currency),
+        eq("u1"),
+        eq("506060000"),
+        eq("combo"),
+        eq("8abc"),
+        eq("t1"),
+        any()
+      );
+    verify(chainLedgerService, times(1))
+      .notifyDepositConfirmed(any(), any(), any(), any(), any(), any(), any());
+  }
+
+  /**
+   * A racing insert used to drop the deferred notice entirely, so both
+   * withdrawals confirmed and the deposit stayed silent. Reloading the row
+   * keeps the confirm path alive.
+   */
+  @Test
+  void combinedSelfSendShouldConfirmAfterARacingInsert() throws Exception {
+    QueueEntity first = confirmedSelfSend("q1", "200000000");
+    QueueEntity second = confirmedSelfSend("q2", "150000000");
+    List<QueueEntity> live = new ArrayList<>(List.of(first, second));
+    when(queuesService.getQueuesByTicker("XMR"))
+      .thenAnswer(invocation -> List.copyOf(live));
+    when(queuesService.deleteQueue(anyString()))
+      .thenAnswer(invocation -> {
+        String id = invocation.getArgument(0);
+        return live
+          .stream()
+          .filter(entry -> id.equals(entry.getId()))
+          .findFirst()
+          .map(entry -> {
+            live.remove(entry);
+            return entry;
+          });
+      });
+    DepositAddressEntity owner = selfSendOwner();
+    when(depositAddressService.getByAddress("XMR", "8abc"))
+      .thenReturn(Optional.of(owner));
+    DepositRecordEntity booked = new DepositRecordEntity(
+      "XMR",
+      "combo",
+      3L,
+      "u1",
+      "506060000",
+      "100"
+    );
+    booked.setTransactionId("t1");
+    when(
+      depositRecordsRepository.findByTickerAndTxidAndAddressIndex(
+        "XMR",
+        "combo",
+        3L
+      )
+    )
+      .thenReturn(
+        Optional.empty(),
+        Optional.empty(),
+        Optional.of(booked),
+        Optional.of(booked)
+      );
+    doThrow(new DuplicateKeyException("dup"))
+      .when(depositRecordsRepository)
+      .insert(any(DepositRecordEntity.class));
+    daemonAt(100L);
+    when(rpc.wallet(eq(currency), eq("get_transfer_by_txid"), any()))
+      .thenReturn(
+        new JSONObject().put("transfer", combinedSelfSendTransfer())
+      );
+
+    pass();
+
+    InOrder order = inOrder(chainLedgerService);
+    order
+      .verify(chainLedgerService)
+      .notifyWithdrawalConfirmed(eq(currency), eq(first), any(), any());
+    order
+      .verify(chainLedgerService)
+      .notifyWithdrawalConfirmed(eq(currency), eq(second), any(), any());
+    order
+      .verify(chainLedgerService)
+      .notifyDepositConfirmed(
+        eq(currency),
+        eq("u1"),
+        eq("506060000"),
+        eq("combo"),
+        eq("8abc"),
+        eq("t1"),
+        any()
+      );
+    verify(chainLedgerService, never())
+      .creditDeposit(any(), any(), any(), any(), any(), any(), anyBoolean());
+  }
+
+  /**
+   * Combined self-sends are discovered when broadcast, as one pending credit
+   * for the sum, the same way an incoming payment is announced from the pool.
+   */
+  @Test
+  void combinedBroadcastShouldAnnounceOneDepositDiscovered() throws Exception {
+    QueueEntity other = confirmedSelfSend("q2", "150000000");
+    other.setProcessed(false);
+    other.setBlockHash(null);
+    queue.setRaw("200000000");
+    queue.setTargetAddress("8abc");
+    when(queuesService.getQueuesByTicker("XMR"))
+      .thenReturn(List.of(queue, other));
+    when(depositAddressService.getByAddress("XMR", "8abc"))
+      .thenReturn(Optional.of(selfSendOwner()));
+    daemonAt(100L);
+    when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
+      .thenReturn(
+        RpcResponse.success(
+          new JSONObject().put("tx_hash", "combo").put("fee", 56060000L)
+        )
+      );
+    when(rpc.wallet(eq(currency), eq("get_transfer_by_txid"), any()))
+      .thenReturn(
+        new JSONObject()
+          .put(
+            "transfer",
+            new JSONObject()
+              .put("txid", "combo")
+              .put("confirmations", 0)
+              .put(
+                "destinations",
+                new JSONArray()
+                  .put(
+                    new JSONObject()
+                      .put("address", "8abc")
+                      .put("amount", 171970000L)
+                  )
+                  .put(
+                    new JSONObject()
+                      .put("address", "8abc")
+                      .put("amount", 121970000L)
+                  )
+              )
+          )
+      );
+
+    pass();
+
+    verify(chainLedgerService)
+      .notifyDepositDiscovered(
+        eq(currency),
+        eq("u1"),
+        eq("293940000"),
+        eq("combo"),
+        eq("8abc"),
+        eq(0L),
+        eq(10),
+        any()
+      );
+    verify(chainLedgerService, times(1))
+      .notifyDepositDiscovered(
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        anyLong(),
+        anyInt(),
+        any()
+      );
+    verify(chainLedgerService, never())
+      .notifyDepositConfirmed(any(), any(), any(), any(), any(), any(), any());
+  }
+
+  /**
+   * The outgoing scan may book a missed credit, but it must not send deposit
+   * notices. Those belong to confirmSend.
+   */
+  @Test
+  void outgoingScanShouldCreditWithoutNotices() throws Exception {
+    currency.setProcessWithdrawals(false);
+    currency.setProcessDeposits(true);
+    when(depositAddressService.getByAddress("XMR", "8abc"))
+      .thenReturn(Optional.of(selfSendOwner()));
+    when(
+      chainLedgerService.creditDeposit(
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        eq(false)
+      )
+    )
+      .thenReturn("t1");
+    daemonAt(100L);
+    JSONObject outgoing = new JSONObject()
+      .put("txid", "combo")
+      .put("confirmations", 10)
+      .put("height", 90)
+      .put(
+        "destinations",
+        new JSONArray()
+          .put(
+            new JSONObject().put("address", "8abc").put("amount", 293940000L)
+          )
+      );
+    when(rpc.wallet(eq(currency), eq("get_transfers"), any()))
+      .thenAnswer(invocation -> {
+        JSONObject params = invocation.getArgument(2);
+        if (params != null && params.optBoolean("out")) {
+          return new JSONObject().put("out", new JSONArray().put(outgoing));
+        }
+        return new JSONObject();
+      });
+
+    pass();
+
+    verify(chainLedgerService)
+      .creditDeposit(
+        eq(currency),
+        eq("u1"),
+        eq("293940000"),
+        eq("combo"),
+        eq("8abc"),
+        any(),
+        eq(false)
+      );
+    verify(chainLedgerService, never())
+      .notifyDepositDiscovered(
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        anyLong(),
+        anyInt(),
+        any()
+      );
+    verify(chainLedgerService, never())
+      .notifyDepositConfirmed(any(), any(), any(), any(), any(), any(), any());
+  }
+
+  /**
+   * A just-confirmed send unlocks change. A withdrawal that was deferred at
+   * this height must be offered again in the same pass, not held for the next
+   * block.
+   */
+  @Test
+  void confirmingASendShouldRetryALockedQueueOnTheSameHeight() throws Exception {
+    QueueEntity first = confirmedSelfSend("q1", "200000000");
+    QueueEntity waiting = secondQueue();
+    List<QueueEntity> live = new ArrayList<>(List.of(first, waiting));
+    when(queuesService.getQueuesByTicker("XMR"))
+      .thenAnswer(invocation -> List.copyOf(live));
+    when(queuesService.deleteQueue(anyString()))
+      .thenAnswer(invocation -> {
+        String id = invocation.getArgument(0);
+        return live
+          .stream()
+          .filter(entry -> id.equals(entry.getId()))
+          .findFirst()
+          .map(entry -> {
+            live.remove(entry);
+            return entry;
+          });
+      });
+    when(depositAddressService.getByAddress("XMR", "8abc"))
+      .thenReturn(Optional.of(selfSendOwner()));
+    when(
+      chainLedgerService.creditDeposit(
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        eq(false)
+      )
+    )
+      .thenReturn("t1");
+    daemonAt(100L, 100L);
+    when(rpc.wallet(eq(currency), eq("get_transfer_by_txid"), any()))
+      .thenReturn(
+        new JSONObject()
+          .put("transfer", new JSONObject().put("confirmations", 9)),
+        new JSONObject().put("transfer", combinedSelfSendTransfer()),
+        new JSONObject()
+      );
+    when(rpc.walletDetailed(eq(currency), eq("transfer"), any()))
+      .thenReturn(RpcResponse.refused(-37, "not enough unlocked money"))
+      .thenReturn(
+        RpcResponse.success(
+          new JSONObject().put("tx_hash", "follow").put("fee", 30700000L)
+        )
+      );
+
+    pass();
+    pass();
+
+    assertEquals("follow", waiting.getBlockHash());
+    assertTrue(waiting.getProcessed());
+    verify(rpc, times(2)).walletDetailed(eq(currency), eq("transfer"), any());
+    verify(chainLedgerService)
+      .notifyWithdrawalConfirmed(eq(currency), eq(first), any(), any());
+    verify(chainLedgerService)
+      .notifyDepositConfirmed(
+        eq(currency),
+        eq("u1"),
+        eq("506060000"),
+        eq("combo"),
+        eq("8abc"),
+        eq("t1"),
+        any()
+      );
+  }
+
+  /**
+   * The last sibling used to drop the notice when destinations were missing,
+   * even though the first sibling had already booked the sum. The existing
+   * credit is enough.
+   */
+  @Test
+  void lastSiblingShouldConfirmFromTheExistingCreditWithoutDestinations()
+    throws Exception {
+    QueueEntity first = confirmedSelfSend("q1", "200000000");
+    QueueEntity second = confirmedSelfSend("q2", "150000000");
+    List<QueueEntity> live = new ArrayList<>(List.of(first, second));
+    when(queuesService.getQueuesByTicker("XMR"))
+      .thenAnswer(invocation -> List.copyOf(live));
+    when(queuesService.deleteQueue(anyString()))
+      .thenAnswer(invocation -> {
+        String id = invocation.getArgument(0);
+        return live
+          .stream()
+          .filter(entry -> id.equals(entry.getId()))
+          .findFirst()
+          .map(entry -> {
+            live.remove(entry);
+            return entry;
+          });
+      });
+    when(depositAddressService.getByAddress("XMR", "8abc"))
+      .thenReturn(Optional.of(selfSendOwner()));
+    DepositRecordEntity booked = new DepositRecordEntity(
+      "XMR",
+      "combo",
+      3L,
+      "u1",
+      "506060000",
+      "100"
+    );
+    booked.setTransactionId("t1");
+    when(
+      depositRecordsRepository.findByTickerAndTxidAndAddressIndex(
+        "XMR",
+        "combo",
+        3L
+      )
+    )
+      .thenReturn(Optional.empty(), Optional.empty(), Optional.of(booked));
+    when(
+      chainLedgerService.creditDeposit(
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        any(),
+        eq(false)
+      )
+    )
+      .thenReturn("t1");
+    daemonAt(100L);
+    when(rpc.wallet(eq(currency), eq("get_transfer_by_txid"), any()))
+      .thenReturn(
+        new JSONObject().put("transfer", combinedSelfSendTransfer()),
+        new JSONObject()
+          .put("transfer", new JSONObject().put("confirmations", 10).put("height", 100))
+      );
+
+    pass();
+
+    InOrder order = inOrder(chainLedgerService);
+    order
+      .verify(chainLedgerService)
+      .notifyWithdrawalConfirmed(eq(currency), eq(first), any(), any());
+    order
+      .verify(chainLedgerService)
+      .notifyWithdrawalConfirmed(eq(currency), eq(second), any(), any());
+    order
+      .verify(chainLedgerService)
+      .notifyDepositConfirmed(
+        eq(currency),
+        eq("u1"),
+        eq("506060000"),
+        eq("combo"),
+        eq("8abc"),
+        eq("t1"),
+        any()
+      );
+    verify(chainLedgerService, times(1))
+      .notifyDepositConfirmed(any(), any(), any(), any(), any(), any(), any());
+  }
+
+  /**
+   * Once the queues are gone, a discovered and credited self-send still owes
+   * Deposit Confirmed. The next pass sends it from the existing row.
+   */
+  @Test
+  void owedDepositConfirmShouldBeSentAfterQueuesAreGone() {
+    DepositNoticeEntity notice = new DepositNoticeEntity(
+      "XMR",
+      "be87",
+      3L,
+      "u1",
+      "1743860000"
+    );
+    DepositRecordEntity booked = new DepositRecordEntity(
+      "XMR",
+      "be87",
+      3L,
+      "u1",
+      "1743860000",
+      "100"
+    );
+    booked.setTransactionId("t1");
+    when(queuesService.getQueuesByTicker("XMR")).thenReturn(List.of());
+    when(depositNoticeService.unconfirmed("XMR")).thenReturn(List.of(notice));
+    when(
+      depositRecordsRepository.findByTickerAndTxidAndAddressIndex(
+        "XMR",
+        "be87",
+        3L
+      )
+    )
+      .thenReturn(Optional.of(booked));
+    when(depositAddressService.getByAddressIndex("XMR", 3L))
+      .thenReturn(Optional.of(selfSendOwner()));
+    daemonAt(100L);
+
+    pass();
+
+    verify(chainLedgerService)
+      .notifyDepositConfirmed(
+        eq(currency),
+        eq("u1"),
+        eq("1743860000"),
+        eq("be87"),
+        eq("8abc"),
+        eq("t1"),
+        any()
+      );
+    verify(chainLedgerService, never())
+      .notifyWithdrawalConfirmed(any(), any(), any(), any());
   }
 
   // --------------------------------------------------------------- refusals

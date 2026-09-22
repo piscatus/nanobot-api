@@ -36,6 +36,8 @@ public class QueueDto extends BaseDto {
 
   private Integer attempts;
 
+  private Integer destIndex;
+
   public QueueDto(QueueEntity entity) {
     super(entity.getId());
     this.userId = entity.getUserId();
@@ -53,6 +55,7 @@ public class QueueDto extends BaseDto {
     this.timestamp = entity.getTimestamp();
     this.transactionId = entity.getTransactionId();
     this.attempts = entity.getAttempts();
+    this.destIndex = entity.getDestIndex();
   }
 
   public Integer getAttempts() {
@@ -61,6 +64,14 @@ public class QueueDto extends BaseDto {
 
   public void setAttempts(Integer attempts) {
     this.attempts = attempts;
+  }
+
+  public Integer getDestIndex() {
+    return destIndex;
+  }
+
+  public void setDestIndex(Integer destIndex) {
+    this.destIndex = destIndex;
   }
 
   public QueueDto(

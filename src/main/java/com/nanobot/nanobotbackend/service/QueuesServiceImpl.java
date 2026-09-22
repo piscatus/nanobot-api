@@ -212,6 +212,18 @@ public class QueuesServiceImpl implements QueuesService {
     String blockHash,
     Boolean processed
   ) {
+    return updateQueueProgress(id, attempts, index, blockHash, processed, null);
+  }
+
+  @Override
+  public boolean updateQueueProgress(
+    String id,
+    Integer attempts,
+    Long index,
+    String blockHash,
+    Boolean processed,
+    Integer destIndex
+  ) {
     if (id == null) {
       return false;
     }
@@ -227,6 +239,9 @@ public class QueuesServiceImpl implements QueuesService {
     }
     if (processed != null) {
       update.set("processed", processed);
+    }
+    if (destIndex != null) {
+      update.set("destIndex", destIndex);
     }
     if (!update.getUpdateObject().containsKey("$set")) {
       return false;

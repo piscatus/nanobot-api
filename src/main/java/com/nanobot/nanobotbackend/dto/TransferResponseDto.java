@@ -47,6 +47,15 @@ public class TransferResponseDto extends BaseResponseDto {
    */
   private String networkFee;
 
+  /**
+   * True when the hot wallet can send this withdrawal only after locked funds
+   * unlock. The user must opt in to waiting; cancel leaves nothing queued.
+   */
+  private boolean delayed;
+
+  /** Why the send would wait, for the confirmation embed. Null when not delayed. */
+  private String delayNotice;
+
   /** The user's default fishing currency after this request, or null for any. */
   private String defaultTicker;
 
@@ -217,6 +226,22 @@ public class TransferResponseDto extends BaseResponseDto {
 
   public void setNetworkFee(String networkFee) {
     this.networkFee = networkFee;
+  }
+
+  public boolean getDelayed() {
+    return delayed;
+  }
+
+  public void setDelayed(boolean delayed) {
+    this.delayed = delayed;
+  }
+
+  public String getDelayNotice() {
+    return delayNotice;
+  }
+
+  public void setDelayNotice(String delayNotice) {
+    this.delayNotice = delayNotice;
   }
 
   public String getDefaultTicker() {

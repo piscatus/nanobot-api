@@ -4,6 +4,7 @@ import com.nanobot.nanobotbackend.dto.LevelDto;
 import com.nanobot.nanobotbackend.dto.QueueDto;
 import com.nanobot.nanobotbackend.entity.CurrencyEntity;
 import com.nanobot.nanobotbackend.entity.DepositAddressEntity;
+import com.nanobot.nanobotbackend.entity.DepositNoticeEntity;
 import com.nanobot.nanobotbackend.entity.DepositRecordEntity;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;
@@ -14,6 +15,8 @@ import com.nanobot.nanobotbackend.service.QueuesService;
 import com.nanobot.nanobotbackend.task.FileLogger;
 import com.nanobot.nanobotbackend.util.Constants;
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -40,8 +43,10 @@ import org.springframework.stereotype.Service;
  * <p>Deposit detection is driven off the daemon's block height rather than
  * polling the wallet every second: the wallet scan only runs when the chain has
  * actually advanced, which is roughly every two minutes. A lighter look at the
- * transaction pool runs more often so a deposit can be announced to its owner
- * before it is mined, although nothing is credited until it is ten blocks deep.
+ * transaction pool runs more often so an incoming deposit can be announced
+ * before it is mined. Nothing is credited until it is ten blocks deep. A send
+ * to one of our own subaddresses is never reported as incoming; it is
+ * discovered at broadcast and confirmed in the same step as the withdrawal.
  */
 @Service
 public class MoneroChainAdapter implements ChainAdapter {
@@ -188,12 +193,12 @@ public class MoneroChainAdapter implements ChainAdapter {
    *
    * <p>{@code do_not_relay} stops short of committing, so nothing is marked
    * spent and the real send later selects afresh. The parameters are the ones
-   * {@link #processSend} uses, so the two cannot drift apart.
+   * the real send uses, so the two cannot drift apart.
    *
-   * <p>A refusal for locked funds is reported as unavailable rather than
-   * rejected: the queue processor waits those out, so the withdrawal should be
-   * accepted with the estimate shown. Every other refusal is a verdict on the
-   * request and is surfaced so the user hears it before anything is debited.
+   * <p>Locked funds are reported as delayed rather than rejected: the send can
+   * go out once the wallet unlocks, but the user has to choose that wait. An
+   * unreachable wallet is unavailable and uses the estimate. Every other
+   * refusal is a verdict on the request and is surfaced before any debit.
    */
   @Override
   public FeeQuote quoteWithdrawalFee(
@@ -238,6 +243,9 @@ public class MoneroChainAdapter implements ChainAdapter {
     }
 
     WalletRefusal refusal = classifyRefusal(currencyEntity, response);
+    if (refusal.kind() == WalletRefusal.Kind.FUNDS_LOCKED) {
+      return FeeQuote.delayed(refusal);
+    }
     if (refusal.isTransient()) {
       return FeeQuote.unavailable();
     }
@@ -258,15 +266,39 @@ public class MoneroChainAdapter implements ChainAdapter {
     String raw,
     String address
   ) {
-    JSONObject destination = new JSONObject()
-      .put(AMOUNT_KEY, new BigInteger(raw).longValueExact())
-      .put(ADDRESS_KEY, address);
+    QueueEntity single = new QueueEntity();
+    single.setRaw(raw);
+    single.setTargetAddress(address);
+    return buildTransferParams(currencyEntity, List.of(single));
+  }
+
+  /**
+   * One {@code transfer} for every queued withdrawal in {@code batch}, oldest
+   * first. The network fee is split across all outputs so a rain of waiting
+   * sends can share one 10-block lock instead of queuing up behind each
+   * other's change.
+   */
+  JSONObject buildTransferParams(
+    CurrencyEntity currencyEntity,
+    List<QueueEntity> batch
+  ) {
+    JSONArray destinations = new JSONArray();
+    JSONArray subtractFeeFrom = new JSONArray();
+    for (int i = 0; i < batch.size(); i++) {
+      QueueEntity entry = batch.get(i);
+      destinations.put(
+        new JSONObject()
+          .put(AMOUNT_KEY, new BigInteger(entry.getRaw()).longValueExact())
+          .put(ADDRESS_KEY, entry.getTargetAddress())
+      );
+      subtractFeeFrom.put(i);
+    }
     return new JSONObject()
-      .put("destinations", new JSONArray().put(destination))
+      .put("destinations", destinations)
       .put(ACCOUNT_INDEX, 0)
       .put("priority", resolveFeePriority(currencyEntity))
       .put("ring_size", 16)
-      .put("subtract_fee_from_outputs", new JSONArray().put(0))
+      .put("subtract_fee_from_outputs", subtractFeeFrom)
       .put("get_tx_key", true);
   }
 
@@ -448,6 +480,13 @@ public class MoneroChainAdapter implements ChainAdapter {
       processDeposits(currencyEntity, daemonHeight, commandMap);
     }
 
+    if (
+      currencyEntity.getProcessWithdrawals() ||
+      currencyEntity.getProcessDeposits()
+    ) {
+      announceOwedDepositConfirms(currencyEntity, commandMap);
+    }
+
     refreshFeeEstimate(currencyEntity);
     refreshLiquidity(currencyEntity);
   }
@@ -563,9 +602,9 @@ public class MoneroChainAdapter implements ChainAdapter {
       "get_transfers",
       new JSONObject()
         .put("in", true)
-        // Outgoing transfers are scanned too. A send to one of our own deposit
-        // addresses is never reported as incoming, so the outgoing side is the
-        // only record that the recipient was paid.
+        // Credit-only safety net for a self-send whose queue was dropped
+        // before the ledger row was written. Notices for those stay on
+        // confirmSend; this path never announces.
         .put("out", true)
         .put("pending", false)
         .put("pool", false)
@@ -592,7 +631,7 @@ public class MoneroChainAdapter implements ChainAdapter {
     JSONArray outgoing = result.optJSONArray("out");
     if (outgoing != null) {
       for (int i = 0; i < outgoing.length(); i++) {
-        creditSelfSend(
+        creditOutgoingIfUnbooked(
           currencyEntity,
           outgoing.getJSONObject(i),
           confirmations,
@@ -846,18 +885,87 @@ public class MoneroChainAdapter implements ChainAdapter {
   }
 
   /**
-   * Credits a transfer whose destination is one of our own deposit addresses.
-   *
-   * <p>Needed because monero-wallet-rpc does not report a send to one of its own
-   * subaddresses as an incoming transfer: the funds never "arrive", they are
-   * internal to the wallet. Without reading the outgoing side, a user paying
-   * another user's shared deposit address, or testing by paying their own, would
-   * be debited and nobody would be credited.
-   *
-   * <p>The destination amount is already net of the network fee, because
-   * withdrawals are built with subtract_fee_from_outputs.
+   * Same announcement as {@link #announceDeposit}, for an outgoing transfer
+   * whose destinations include one of our deposit addresses. wallet-rpc never
+   * reports those as {@code in} or {@code pool}, so the outgoing side is the
+   * only sighting. Amounts to the same address are summed so a combined send
+   * is one discovery, matching the one credit.
    */
-  private void creditSelfSend(
+  private void announceInternalDeposits(
+    CurrencyEntity currencyEntity,
+    JSONObject transfer,
+    long depth,
+    int confirmations,
+    Map<String, String> commandMap
+  ) {
+    String ticker = currencyEntity.getTicker();
+    String txid = transfer.optString("txid", null);
+    if (txid == null || txid.isBlank()) {
+      return;
+    }
+    if (transfer.optLong("unlock_time", 0L) > 0L) {
+      return;
+    }
+
+    for (InternalDeposit dest : internalDeposits(ticker, transfer)) {
+      Long addressIndex = dest.owner().getAddressIndex();
+      if (
+        depositRecordsRepository.existsByTickerAndTxidAndAddressIndex(
+          ticker,
+          txid,
+          addressIndex
+        )
+      ) {
+        continue;
+      }
+      String userId = dest.owner().getUserId();
+      if (
+        !depositNoticeService.recordFirstSighting(
+          ticker,
+          txid,
+          addressIndex,
+          userId,
+          dest.amount().toString()
+        )
+      ) {
+        continue;
+      }
+
+      chainLedgerService.notifyDepositDiscovered(
+        currencyEntity,
+        userId,
+        dest.amount().toString(),
+        txid,
+        dest.owner().getAddress(),
+        depth,
+        confirmations,
+        commandMap
+      );
+
+      fileLogger.info(
+        "Discovered " +
+        dest.amount() +
+        " " +
+        ticker +
+        " for user " +
+        userId +
+        " in outgoing " +
+        txid +
+        " (" +
+        depth +
+        " of " +
+        confirmations +
+        " confirmations)"
+      );
+    }
+  }
+
+  /**
+   * Credits a mature outgoing transfer that paid one of our deposit addresses
+   * if {@link #confirmSend} never wrote the row. No notices: those belong to
+   * the withdrawal confirm path.
+   */
+  private void creditOutgoingIfUnbooked(
     CurrencyEntity currencyEntity,
     JSONObject transfer,
     int confirmations,
@@ -868,47 +976,23 @@ public class MoneroChainAdapter implements ChainAdapter {
     if (txid == null) {
       return;
     }
+    if (transfer.optLong("unlock_time", 0L) > 0L) {
+      return;
+    }
     if (transfer.optLong("confirmations", 0L) < confirmations) {
       return;
     }
 
-    JSONArray destinations = transfer.optJSONArray("destinations");
-    if (destinations == null) {
-      return;
-    }
-
     String height = String.valueOf(transfer.optLong("height", 0L));
-
-    for (int i = 0; i < destinations.length(); i++) {
-      JSONObject destination = destinations.getJSONObject(i);
-      String address = destination.optString(ADDRESS_KEY, null);
-      if (address == null) {
-        continue;
-      }
-
-      // Anything we did not issue is an ordinary external withdrawal.
-      Optional<DepositAddressEntity> owner = depositAddressService.getByAddress(
-        ticker,
-        address
-      );
-      if (owner.isEmpty()) {
-        continue;
-      }
-
-      BigInteger amount = BigInteger.valueOf(
-        destination.optLong(AMOUNT_KEY, 0L)
-      );
-      if (amount.signum() <= 0) {
-        continue;
-      }
-
-      creditToOwner(
+    for (InternalDeposit dest : internalDeposits(ticker, transfer)) {
+      bookDeposit(
         currencyEntity,
-        owner.get(),
+        dest.owner(),
         txid,
-        amount,
+        dest.amount(),
         height,
-        commandMap
+        commandMap,
+        false
       );
     }
   }
@@ -929,56 +1013,14 @@ public class MoneroChainAdapter implements ChainAdapter {
     String height,
     Map<String, String> commandMap
   ) {
-    String ticker = currencyEntity.getTicker();
-    Long addressIndex = owner.getAddressIndex();
-    String userId = owner.getUserId();
-
-    if (
-      depositRecordsRepository.existsByTickerAndTxidAndAddressIndex(
-        ticker,
-        txid,
-        addressIndex
-      )
-    ) {
-      return;
-    }
-
-    DepositRecordEntity record = new DepositRecordEntity(
-      ticker,
-      txid,
-      addressIndex,
-      userId,
-      amount.toString(),
-      height
-    );
-    record.setId(new ObjectId().toHexString());
-    try {
-      depositRecordsRepository.insert(record);
-    } catch (DuplicateKeyException e) {
-      return;
-    }
-
-    String transactionId = chainLedgerService.creditDeposit(
+    bookDeposit(
       currencyEntity,
-      userId,
-      amount.toString(),
+      owner,
       txid,
-      owner.getAddress(),
-      commandMap
-    );
-
-    record.setTransactionId(transactionId);
-    depositRecordsRepository.save(record);
-
-    fileLogger.info(
-      "Credited " +
-      amount +
-      " " +
-      ticker +
-      " to user " +
-      userId +
-      " from " +
-      txid
+      amount,
+      height,
+      commandMap,
+      true
     );
   }
 
@@ -991,7 +1033,12 @@ public class MoneroChainAdapter implements ChainAdapter {
   ) {
     String ticker = currencyEntity.getTicker();
     // Oldest first so a waiting withdrawal is not skipped in favour of a newer
-    // one. Each send is its own transaction; grouping comes later if needed.
+    // one. Unsent entries are gathered and sent as one multi-destination
+    // transfer when the wallet can cover them together, so several users
+    // waiting on the same locked change share one 10-block wait instead of
+    // queuing up behind each other's change.
+    List<QueueEntity> pending = new ArrayList<>();
+    boolean unlockedThisPass = false;
     for (QueueEntity queueEntity : queuesService.getQueuesByTicker(ticker)) {
       if (queueEntity.getLevel() == LevelDto.UPDATE) {
         // Monero has no representative to set. Such an entry can only be a
@@ -1009,18 +1056,155 @@ public class MoneroChainAdapter implements ChainAdapter {
         continue;
       }
       if (queueEntity.getProcessed()) {
-        confirmSend(queueEntity, currencyEntity, commandMap);
+        if (confirmSend(queueEntity, currencyEntity, commandMap)) {
+          unlockedThisPass = true;
+        }
       } else {
-        processSend(queueEntity, currencyEntity, daemonHeight, commandMap);
+        pending.add(queueEntity);
       }
     }
+    // A just-confirmed send unlocks its change. Retry waiting withdrawals in
+    // this same pass instead of waiting for the next block.
+    if (unlockedThisPass) {
+      deferredAtHeight.clear();
+    }
+    processPendingSends(pending, currencyEntity, daemonHeight, commandMap);
   }
 
-  private void processSend(
-    QueueEntity queueEntity,
+  /**
+   * Sends every ready withdrawal that will fit in one transfer, shrinking the
+   * oldest-first prefix until the wallet accepts it. A full lock defers the
+   * remainder together so they retry as a group when the next block lands.
+   */
+  private void processPendingSends(
+    List<QueueEntity> pending,
     CurrencyEntity currencyEntity,
     long daemonHeight,
     Map<String, String> commandMap
+  ) {
+    List<QueueEntity> ready = new ArrayList<>();
+    for (QueueEntity queueEntity : pending) {
+      if (!prepareSend(queueEntity, currencyEntity, daemonHeight)) {
+        continue;
+      }
+      ready.add(queueEntity);
+    }
+
+    while (!ready.isEmpty()) {
+      int n = ready.size();
+      RpcResponse response = null;
+      while (n >= 1) {
+        List<QueueEntity> batch = ready.subList(0, n);
+        JSONObject params;
+        try {
+          params = buildTransferParams(currencyEntity, batch);
+        } catch (RuntimeException e) {
+          if (n > 1) {
+            n--;
+            continue;
+          }
+          fileLogger.error(
+            "Could not build a " +
+            currencyEntity.getTicker() +
+            " transfer for queue #" +
+            ready.get(0).getId() +
+            ": " +
+            e.getMessage()
+          );
+          handleSendFailure(
+            ready.get(0),
+            currencyEntity,
+            new WalletRefusal(
+              WalletRefusal.Kind.OTHER,
+              "The bot's " +
+              currencyEntity.getName() +
+              " wallet could not create this transaction."
+            ),
+            commandMap
+          );
+          ready.remove(0);
+          response = null;
+          break;
+        }
+
+        response = rpc.walletDetailed(currencyEntity, "transfer", params);
+        if (response.isSuccess()) {
+          break;
+        }
+
+        WalletRefusal refusal = classifyRefusal(currencyEntity, response);
+        if (refusal.kind() == WalletRefusal.Kind.UNREACHABLE) {
+          fileLogger.warn(
+            "Could not reach the " +
+            currencyEntity.getTicker() +
+            " wallet for queue #" +
+            batch.get(0).getId() +
+            "; will retry."
+          );
+          return;
+        }
+        if (n == 1) {
+          if (refusal.kind() == WalletRefusal.Kind.FUNDS_LOCKED) {
+            for (QueueEntity waiting : ready) {
+              deferSend(waiting, currencyEntity, daemonHeight, commandMap);
+            }
+            return;
+          }
+          handleSendFailure(ready.get(0), currencyEntity, refusal, commandMap);
+          ready.remove(0);
+          response = null;
+          break;
+        }
+        n--;
+      }
+
+      if (response == null || !response.isSuccess()) {
+        continue;
+      }
+
+      String txHash = response.resultString(TX_HASH_KEY);
+      if (txHash == null) {
+        fileLogger.warn(
+          currencyEntity.getTicker() +
+          " wallet accepted the transfer for queue #" +
+          ready.get(0).getId() +
+          " but returned no tx_hash; will retry."
+        );
+        return;
+      }
+
+      JSONObject result = response.result();
+      List<QueueEntity> sent = new ArrayList<>(ready.subList(0, n));
+      List<BigInteger> feeShares = splitFee(broadcastFee(result), sent.size());
+      for (int i = 0; i < sent.size(); i++) {
+        recordBroadcast(
+          sent.get(i),
+          currencyEntity,
+          txHash,
+          result.optLong("fee", 0L),
+          feeShares.get(i),
+          commandMap
+        );
+      }
+      announceBroadcastDeposits(
+        sent,
+        currencyEntity,
+        txHash,
+        feeShares,
+        commandMap
+      );
+      ready.subList(0, n).clear();
+    }
+  }
+
+  /**
+   * Recovery, the per-block deferral gate, and the attempt-height stamp.
+   * False means this entry is not a candidate for a send on this pass.
+   */
+  private boolean prepareSend(
+    QueueEntity queueEntity,
+    CurrencyEntity currencyEntity,
+    long daemonHeight
   ) {
     // Recover before sending again. If a previous attempt broadcast a
     // transaction but died before the hash was saved, sending now would pay the
@@ -1032,13 +1216,12 @@ public class MoneroChainAdapter implements ChainAdapter {
         queueEntity.getIndex()
       );
       if (!check.conclusive()) {
-        // The wallet did not answer. Resending now could double-pay, so wait.
         fileLogger.warn(
           "Cannot verify whether queue #" +
           queueEntity.getId() +
           " was already broadcast; deferring rather than risking a double send."
         );
-        return;
+        return false;
       }
       if (check.txid() != null) {
         String recovered = check.txid();
@@ -1057,19 +1240,15 @@ public class MoneroChainAdapter implements ChainAdapter {
           recovered,
           true
         );
-        return;
+        return false;
       }
     }
 
-    // A withdrawal waiting for locked funds is only worth retrying once the
-    // chain has moved, since that is the only thing that can unlock them.
     Long deferredAt = deferredAtHeight.get(queueEntity.getId());
     if (deferredAt != null && daemonHeight <= deferredAt) {
-      return;
+      return false;
     }
 
-    // Mark the attempt height first so the recovery scan above has a lower
-    // bound if this process dies mid-send.
     if (queueEntity.getIndex() == null) {
       queueEntity.setIndex(daemonHeight);
       queuesService.updateQueueProgress(
@@ -1080,86 +1259,17 @@ public class MoneroChainAdapter implements ChainAdapter {
         null
       );
     }
+    return true;
+  }
 
-    JSONObject params;
-    try {
-      params = buildTransferParams(
-        currencyEntity,
-        queueEntity.getRaw(),
-        queueEntity.getTargetAddress()
-      );
-    } catch (RuntimeException e) {
-      fileLogger.error(
-        "Could not build a " +
-        currencyEntity.getTicker() +
-        " transfer for queue #" +
-        queueEntity.getId() +
-        ": " +
-        e.getMessage()
-      );
-      handleSendFailure(
-        queueEntity,
-        currencyEntity,
-        new WalletRefusal(
-          WalletRefusal.Kind.OTHER,
-          "The bot's " +
-          currencyEntity.getName() +
-          " wallet could not create this transaction."
-        ),
-        commandMap
-      );
-      return;
-    }
-
-    RpcResponse response = rpc.walletDetailed(
-      currencyEntity,
-      "transfer",
-      params
-    );
-
-    if (!response.isSuccess()) {
-      WalletRefusal refusal = classifyRefusal(currencyEntity, response);
-      switch (refusal.kind()) {
-        case UNREACHABLE -> fileLogger.warn(
-          // Not counted as an attempt: the send was never judged. The entry
-          // waits for the wallet to come back, as a brief outage must not
-          // cancel a good withdrawal.
-          "Could not reach the " +
-          currencyEntity.getTicker() +
-          " wallet for queue #" +
-          queueEntity.getId() +
-          "; will retry."
-        );
-        case FUNDS_LOCKED -> deferSend(
-          queueEntity,
-          currencyEntity,
-          daemonHeight,
-          commandMap
-        );
-        default -> handleSendFailure(
-          queueEntity,
-          currencyEntity,
-          refusal,
-          commandMap
-        );
-      }
-      return;
-    }
-
-    String txHash = response.resultString(TX_HASH_KEY);
-    if (txHash == null) {
-      // The wallet answered but gave nothing to record. Counting that as a
-      // refusal would burn attempts on a malformed success; wait and retry.
-      fileLogger.warn(
-        currencyEntity.getTicker() +
-        " wallet accepted the transfer for queue #" +
-        queueEntity.getId() +
-        " but returned no tx_hash; will retry."
-      );
-      return;
-    }
-
-    JSONObject result = response.result();
+  private void recordBroadcast(
+    QueueEntity queueEntity,
+    CurrencyEntity currencyEntity,
+    String txHash,
+    long totalFee,
+    BigInteger feeShare,
+    Map<String, String> commandMap
+  ) {
     clearDeferral(queueEntity.getId());
     queueEntity.setBlockHash(txHash);
     queueEntity.setProcessed(true);
@@ -1176,20 +1286,19 @@ public class MoneroChainAdapter implements ChainAdapter {
       currencyEntity.getTicker() +
       " withdrawal " +
       queueEntity.getBlockHash() +
+      " for queue #" +
+      queueEntity.getId() +
       " (fee " +
-      result.optLong("fee", 0L) +
+      totalFee +
       " deducted from the amount sent)"
     );
 
-    // Only on a fresh broadcast. The recovery path above cannot tell whether
-    // this was already announced before the crash, and a second "sent" would
-    // look like a second withdrawal.
     chainLedgerService.notifyWithdrawalSent(
       currencyEntity,
       queueEntity,
       ChainSettings.confirmations(currencyEntity, DEFAULT_CONFIRMATIONS),
       commandMap,
-      broadcastFee(result)
+      feeShare
     );
   }
 
@@ -1203,7 +1312,8 @@ public class MoneroChainAdapter implements ChainAdapter {
    * is waiting rather than lost. Attempts are not counted, because counting
    * them would turn a normal wait into a refund with a misleading reason.
    * There is no time bound: older entries stay at the front of the queue
-   * until the wallet can spend.
+   * and are sent together with whoever else is waiting, in one transfer,
+   * once the wallet can spend.
    */
   private void deferSend(
     QueueEntity queueEntity,
@@ -1498,18 +1608,51 @@ public class MoneroChainAdapter implements ChainAdapter {
    * Whether a reported destination belongs to a queued withdrawal of
    * {@code expected}.
    *
-   * <p>Net is the real case, because the fee is taken out of the output. Gross
-   * is accepted too so the check does not depend on that staying true.
+   * <p>The destination is net of this output's share of the fee. A solo send
+   * subtracts the whole fee, so {@code received + fee == expected}. A combined
+   * send splits the fee across outputs, so the share is between zero and the
+   * full fee. Gross is accepted too ({@code received == expected}) so the check
+   * does not depend on subtract_fee_from_outputs staying true.
    */
   static boolean matchesQueuedAmount(
     BigInteger expected,
     BigInteger received,
     BigInteger fee
   ) {
-    return (
-      expected.compareTo(received) == 0 ||
-      expected.compareTo(received.add(fee)) == 0
-    );
+    if (expected == null || received == null || fee == null) {
+      return false;
+    }
+    if (received.signum() < 0) {
+      return false;
+    }
+    BigInteger delta = expected.subtract(received);
+    return delta.signum() >= 0 && delta.compareTo(fee) <= 0;
+  }
+
+  /**
+   * Splits a combined-transaction fee the way wallet2 does: equal shares,
+   * remainder on the last output. A missing or zero fee leaves each notice
+   * without a figure rather than claiming nobody paid one.
+   */
+  static List<BigInteger> splitFee(BigInteger fee, int n) {
+    List<BigInteger> shares = new ArrayList<>();
+    if (n <= 0) {
+      return shares;
+    }
+    if (fee == null || fee.signum() <= 0) {
+      for (int i = 0; i < n; i++) {
+        shares.add(null);
+      }
+      return shares;
+    }
+    BigInteger count = BigInteger.valueOf(n);
+    BigInteger each = fee.divide(count);
+    BigInteger remainder = fee.remainder(count);
+    for (int i = 0; i < n - 1; i++) {
+      shares.add(each);
+    }
+    shares.add(each.add(remainder));
+    return shares;
   }
 
   static BigInteger broadcastFee(JSONObject transfer) {
@@ -1520,7 +1663,12 @@ public class MoneroChainAdapter implements ChainAdapter {
     return fee > 0L ? BigInteger.valueOf(fee) : null;
   }
 
-  private void confirmSend(
+  /**
+   * True when this queue reached the required confirmations and was closed.
+   * A just-confirmed send unlocks change, so the caller can retry waiting
+   * withdrawals in the same pass.
+   */
+  private boolean confirmSend(
     QueueEntity queueEntity,
     CurrencyEntity currencyEntity,
     Map<String, String> commandMap
@@ -1533,30 +1681,22 @@ public class MoneroChainAdapter implements ChainAdapter {
         .put(ACCOUNT_INDEX, 0)
     );
     if (result == null) {
-      return;
+      return false;
     }
     JSONObject transfer = result.optJSONObject("transfer");
     if (transfer == null) {
-      return;
+      return false;
     }
     if (
       transfer.optLong("confirmations", 0L) <
       ChainSettings.confirmations(currencyEntity, DEFAULT_CONFIRMATIONS)
     ) {
-      return;
+      return false;
     }
-    // Wait for the destination to be spendable before crediting the recipient,
-    // matching the rule applied to ordinary deposits.
 
-    // A withdrawal to one of our own deposit addresses has to be credited from
-    // the outgoing transfer. The wallet does not report a send to its own
-    // subaddress as an incoming transfer, so the deposit scanner never sees it,
-    // and without this the recipient would be debited-but-never-credited.
-    //
-    // The ledger credit happens here, before the queue entry is dropped, since
-    // that order is what keeps a crash in between recoverable. Only the user's
-    // deposit notice is held back, so the withdrawal that caused it is
-    // announced first and the two messages read in the order things happened.
+    // Credit before dropping the queue so a crash in between is recoverable.
+    // Deposit Confirmed waits only until every withdrawal on this tx has
+    // been announced, then goes out in this same call.
     DeferredDepositNotice deferred = creditInternalDestination(
       currencyEntity,
       queueEntity,
@@ -1572,44 +1712,152 @@ public class MoneroChainAdapter implements ChainAdapter {
         currencyEntity,
         queueEntity,
         commandMap,
-        broadcastFee(transfer)
+        destinationFeeShare(transfer, queueEntity)
       );
     }
 
-    if (deferred != null) {
+    DeferredDepositNotice owed = deferred != null
+      ? deferred
+      : noticeFromExisting(currencyEntity, queueEntity, transfer);
+    if (
+      owed != null &&
+      !hasOpenWithdrawal(
+        currencyEntity.getTicker(),
+        owed.txid(),
+        queueEntity.getId()
+      ) &&
+      depositNoticeService.recordConfirmSent(
+        currencyEntity.getTicker(),
+        owed.txid(),
+        owed.addressIndex(),
+        owed.userId(),
+        owed.raw()
+      )
+    ) {
       chainLedgerService.notifyDepositConfirmed(
         currencyEntity,
-        deferred.userId(),
-        deferred.raw(),
-        deferred.txid(),
-        deferred.address(),
-        deferred.transactionId(),
+        owed.userId(),
+        owed.raw(),
+        owed.txid(),
+        owed.address(),
+        owed.transactionId(),
+        commandMap
+      );
+    }
+    return true;
+  }
+
+  /**
+   * True when another SEND queue still belongs to this on-chain transaction.
+   * The deposit confirm waits until every withdrawal confirm for that
+   * transaction has gone out. {@code exceptId} is the queue just confirmed, so
+   * a stale read of that row cannot hold the notice forever.
+   */
+  private boolean hasOpenWithdrawal(
+    String ticker,
+    String txid,
+    String exceptId
+  ) {
+    if (txid == null) {
+      return false;
+    }
+    for (QueueEntity other : queuesService.getQueuesByTicker(ticker)) {
+      if (exceptId != null && exceptId.equals(other.getId())) {
+        continue;
+      }
+      if (other.getLevel() != LevelDto.SEND) {
+        continue;
+      }
+      if (txid.equals(other.getBlockHash())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Deposit Confirmed still owed after the withdrawal queues for that
+   * transaction are gone. confirmSend is the first attempt; this is how a
+   * skipped last-sibling notice is not lost once the credit exists.
+   */
+  private void announceOwedDepositConfirms(
+    CurrencyEntity currencyEntity,
+    Map<String, String> commandMap
+  ) {
+    String ticker = currencyEntity.getTicker();
+    for (DepositNoticeEntity notice : depositNoticeService.unconfirmed(ticker)) {
+      if (hasOpenWithdrawal(ticker, notice.getTxid(), null)) {
+        continue;
+      }
+      Optional<DepositRecordEntity> record =
+        depositRecordsRepository.findByTickerAndTxidAndAddressIndex(
+          ticker,
+          notice.getTxid(),
+          notice.getAddressIndex()
+        );
+      if (
+        record == null ||
+        record.isEmpty() ||
+        record.get().getTransactionId() == null
+      ) {
+        continue;
+      }
+      Optional<DepositAddressEntity> owner =
+        depositAddressService.getByAddressIndex(
+          ticker,
+          notice.getAddressIndex()
+        );
+      if (owner == null || owner.isEmpty()) {
+        continue;
+      }
+      if (
+        !depositNoticeService.recordConfirmSent(
+          ticker,
+          notice.getTxid(),
+          notice.getAddressIndex(),
+          notice.getUserId(),
+          record.get().getRaw()
+        )
+      ) {
+        continue;
+      }
+      chainLedgerService.notifyDepositConfirmed(
+        currencyEntity,
+        notice.getUserId(),
+        record.get().getRaw(),
+        notice.getTxid(),
+        owner.get().getAddress(),
+        record.get().getTransactionId(),
         commandMap
       );
     }
   }
 
   /**
-   * A deposit that has been credited on the ledger but whose user notice has
-   * been held back, so the caller can send it after the withdrawal notice.
+   * A deposit that has been credited on the ledger but whose user notice may
+   * still be waiting on sibling withdrawals or the durable confirm flag.
    */
   private record DeferredDepositNotice(
     String userId,
     String raw,
     String txid,
     String address,
+    Long addressIndex,
     String transactionId
   ) {}
+
+  private record InternalDeposit(DepositAddressEntity owner, BigInteger amount) {}
 
   /**
    * Credits the owner of a deposit address that received one of our own
    * withdrawals, and returns the notice still owed to them, or null when nothing
    * was credited.
    *
-   * <p>Credits what the destination actually received, which is the requested
-   * amount minus the network fee, taken from the transfer's own destination
-   * entry rather than recomputed. Guarded by the same depositRecords unique
-   * index as a normal deposit, so it cannot double-credit.
+   * <p>A combined send can pay the same deposit address several times in one
+   * transaction; those outputs share a depositRecords key, so this sums every
+   * destination to the address and books it once. Later queue entries for the
+   * same tx see the record and return the same notice. The caller announces
+   * after the last withdrawal on that transaction.
    */
   private DeferredDepositNotice creditInternalDestination(
     CurrencyEntity currencyEntity,
@@ -1617,37 +1865,33 @@ public class MoneroChainAdapter implements ChainAdapter {
     JSONObject transfer,
     Map<String, String> commandMap
   ) {
-    String ticker = currencyEntity.getTicker();
-    Optional<DepositAddressEntity> recipient =
-      depositAddressService.getByAddress(
-        ticker,
-        queueEntity.getTargetAddress()
-      );
+    DeferredDepositNotice already = noticeFromExisting(
+      currencyEntity,
+      queueEntity,
+      transfer
+    );
+    if (already != null) {
+      return already;
+    }
+
+    Optional<DepositAddressEntity> recipient = recipientOf(
+      currencyEntity.getTicker(),
+      queueEntity,
+      transfer
+    );
     if (recipient.isEmpty()) {
       return null;
     }
 
     String txid = queueEntity.getBlockHash();
-    Long addressIndex = recipient.get().getAddressIndex();
-
-    if (
-      depositRecordsRepository.existsByTickerAndTxidAndAddressIndex(
-        ticker,
-        txid,
-        addressIndex
-      )
-    ) {
-      return null;
-    }
-
     BigInteger received = resolveDestinationAmount(
       transfer,
-      queueEntity.getTargetAddress()
+      recipient.get().getAddress()
     );
     if (received == null || received.signum() <= 0) {
       fileLogger.error(
         "Could not determine the amount received by " +
-        queueEntity.getTargetAddress() +
+        recipient.get().getAddress() +
         " in " +
         txid +
         "; the recipient has not been credited."
@@ -1655,63 +1899,280 @@ public class MoneroChainAdapter implements ChainAdapter {
       return null;
     }
 
-    String userId = recipient.get().getUserId();
+    DepositRecordEntity record = bookDeposit(
+      currencyEntity,
+      recipient.get(),
+      txid,
+      received,
+      String.valueOf(transfer.optLong("height", 0L)),
+      commandMap,
+      false
+    );
+    return noticeFrom(record, recipient.get().getAddress());
+  }
+
+  /**
+   * The notice for an already-credited self-send. Used when this sibling cannot
+   * resolve destinations but an earlier one (or the outgoing scan) already
+   * booked the sum.
+   */
+  private DeferredDepositNotice noticeFromExisting(
+    CurrencyEntity currencyEntity,
+    QueueEntity queueEntity,
+    JSONObject transfer
+  ) {
+    Optional<DepositAddressEntity> recipient = recipientOf(
+      currencyEntity.getTicker(),
+      queueEntity,
+      transfer
+    );
+    if (recipient.isEmpty()) {
+      return null;
+    }
+    Optional<DepositRecordEntity> existing =
+      depositRecordsRepository.findByTickerAndTxidAndAddressIndex(
+        currencyEntity.getTicker(),
+        queueEntity.getBlockHash(),
+        recipient.get().getAddressIndex()
+      );
+    if (existing == null || existing.isEmpty()) {
+      return null;
+    }
+    return noticeFrom(existing.get(), recipient.get().getAddress());
+  }
+
+  private Optional<DepositAddressEntity> recipientOf(
+    String ticker,
+    QueueEntity queueEntity,
+    JSONObject transfer
+  ) {
+    Optional<DepositAddressEntity> recipient = ownerOf(
+      ticker,
+      queueEntity.getTargetAddress()
+    );
+    if (recipient.isPresent()) {
+      return recipient;
+    }
+    for (InternalDeposit dest : internalDeposits(ticker, transfer)) {
+      return Optional.of(dest.owner());
+    }
+    return Optional.empty();
+  }
+
+  /**
+   * Inserts the deposit record and credits the ledger exactly once. A racing
+   * insert reloads the existing row instead of dropping the notice.
+   */
+  private DepositRecordEntity bookDeposit(
+    CurrencyEntity currencyEntity,
+    DepositAddressEntity owner,
+    String txid,
+    BigInteger amount,
+    String height,
+    Map<String, String> commandMap,
+    boolean notify
+  ) {
+    String ticker = currencyEntity.getTicker();
+    Long addressIndex = owner.getAddressIndex();
+    Optional<DepositRecordEntity> existing =
+      depositRecordsRepository.findByTickerAndTxidAndAddressIndex(
+        ticker,
+        txid,
+        addressIndex
+      );
+    if (existing != null && existing.isPresent()) {
+      return existing.get();
+    }
+
     DepositRecordEntity record = new DepositRecordEntity(
       ticker,
       txid,
       addressIndex,
-      userId,
-      received.toString(),
-      String.valueOf(transfer.optLong("height", 0L))
+      owner.getUserId(),
+      amount.toString(),
+      height
     );
     record.setId(new ObjectId().toHexString());
     try {
       depositRecordsRepository.insert(record);
     } catch (DuplicateKeyException e) {
-      return null;
+      return depositRecordsRepository
+        .findByTickerAndTxidAndAddressIndex(ticker, txid, addressIndex)
+        .orElse(null);
     }
 
     String transactionId = chainLedgerService.creditDeposit(
       currencyEntity,
-      userId,
-      received.toString(),
+      owner.getUserId(),
+      amount.toString(),
       txid,
-      recipient.get().getAddress(),
+      owner.getAddress(),
       commandMap,
-      false
+      notify
     );
     record.setTransactionId(transactionId);
     depositRecordsRepository.save(record);
 
-    fileLogger.info(
-      "Credited " +
-      received +
-      " " +
-      ticker +
-      " to user " +
-      userId +
-      " from internal withdrawal " +
-      txid
-    );
+    if (transactionId != null) {
+      fileLogger.info(
+        "Credited " +
+        amount +
+        " " +
+        ticker +
+        " to user " +
+        owner.getUserId() +
+        " from " +
+        txid
+      );
+      if (notify) {
+        depositNoticeService.recordConfirmSent(
+          ticker,
+          txid,
+          addressIndex,
+          owner.getUserId(),
+          amount.toString()
+        );
+      }
+    }
+    return record;
+  }
 
-    if (transactionId == null) {
-      // The transfer failed and was logged by the ledger service. There is
-      // nothing to announce, and announcing would claim a credit that did not
-      // happen.
+  private static DeferredDepositNotice noticeFrom(
+    DepositRecordEntity record,
+    String address
+  ) {
+    if (record == null || record.getTransactionId() == null) {
       return null;
     }
-
     return new DeferredDepositNotice(
-      userId,
-      received.toString(),
-      txid,
-      recipient.get().getAddress(),
-      transactionId
+      record.getUserId(),
+      record.getRaw(),
+      record.getTxid(),
+      address,
+      record.getAddressIndex(),
+      record.getTransactionId()
     );
   }
 
-  /** The amount a specific address received in a transfer, or null if absent. */
-  private BigInteger resolveDestinationAmount(
+  private Optional<DepositAddressEntity> ownerOf(String ticker, String address) {
+    if (address == null) {
+      return Optional.empty();
+    }
+    Optional<DepositAddressEntity> owner = depositAddressService.getByAddress(
+      ticker,
+      address
+    );
+    return owner == null ? Optional.empty() : owner;
+  }
+
+  /**
+   * Destinations on an outgoing transfer that land on a Nanobot deposit
+   * address, summed per address.
+   */
+  private List<InternalDeposit> internalDeposits(
+    String ticker,
+    JSONObject transfer
+  ) {
+    JSONArray destinations = transfer.optJSONArray("destinations");
+    if (destinations == null) {
+      return List.of();
+    }
+    Map<String, InternalDeposit> byAddress = new LinkedHashMap<>();
+    for (int i = 0; i < destinations.length(); i++) {
+      JSONObject destination = destinations.getJSONObject(i);
+      String address = destination.optString(ADDRESS_KEY, null);
+      Optional<DepositAddressEntity> owner = ownerOf(ticker, address);
+      if (owner.isEmpty()) {
+        continue;
+      }
+      long amount = destination.optLong(AMOUNT_KEY, -1L);
+      if (amount <= 0L) {
+        continue;
+      }
+      InternalDeposit next = new InternalDeposit(
+        owner.get(),
+        BigInteger.valueOf(amount)
+      );
+      byAddress.merge(
+        address,
+        next,
+        (left, right) ->
+          new InternalDeposit(left.owner(), left.amount().add(right.amount()))
+      );
+    }
+    return new ArrayList<>(byAddress.values());
+  }
+
+  /**
+   * Discovers a self-send at broadcast time, the same moment the outgoing
+   * transfer first exists. Uses the wallet's destinations when it has them;
+   * otherwise reconstructs them from the batch so a failed lookup still
+   * announces the sum.
+   */
+  private void announceBroadcastDeposits(
+    List<QueueEntity> sent,
+    CurrencyEntity currencyEntity,
+    String txHash,
+    List<BigInteger> feeShares,
+    Map<String, String> commandMap
+  ) {
+    JSONObject result = rpc.wallet(
+      currencyEntity,
+      "get_transfer_by_txid",
+      new JSONObject().put("txid", txHash).put(ACCOUNT_INDEX, 0)
+    );
+    JSONObject transfer = result == null ? null : result.optJSONObject("transfer");
+    if (transfer == null || transfer.optJSONArray("destinations") == null) {
+      transfer = synthesizeOutgoing(txHash, sent, feeShares);
+    } else if (transfer.optString("txid", "").isBlank()) {
+      transfer.put("txid", txHash);
+    }
+    announceInternalDeposits(
+      currencyEntity,
+      transfer,
+      0L,
+      ChainSettings.confirmations(currencyEntity, DEFAULT_CONFIRMATIONS),
+      commandMap
+    );
+  }
+
+  private static JSONObject synthesizeOutgoing(
+    String txHash,
+    List<QueueEntity> sent,
+    List<BigInteger> feeShares
+  ) {
+    JSONArray destinations = new JSONArray();
+    for (int i = 0; i < sent.size(); i++) {
+      QueueEntity queueEntity = sent.get(i);
+      BigInteger amount;
+      try {
+        amount = new BigInteger(queueEntity.getRaw());
+      } catch (NumberFormatException e) {
+        continue;
+      }
+      BigInteger feeShare =
+        feeShares != null && i < feeShares.size() ? feeShares.get(i) : null;
+      if (feeShare != null) {
+        amount = amount.subtract(feeShare);
+      }
+      if (amount.signum() < 0) {
+        amount = BigInteger.ZERO;
+      }
+      destinations.put(
+        new JSONObject()
+          .put(ADDRESS_KEY, queueEntity.getTargetAddress())
+          .put(AMOUNT_KEY, amount.longValue())
+      );
+    }
+    return new JSONObject().put("txid", txHash).put("destinations", destinations);
+  }
+
+  /**
+   * Total this address received in {@code transfer}, or null if it is not a
+   * destination. Several outputs to the same address are summed so a combined
+   * withdrawal to one deposit address is credited in full.
+   */
+  static BigInteger resolveDestinationAmount(
     JSONObject transfer,
     String address
   ) {
@@ -1719,13 +2180,72 @@ public class MoneroChainAdapter implements ChainAdapter {
     if (destinations == null) {
       return null;
     }
+    BigInteger total = null;
     for (int i = 0; i < destinations.length(); i++) {
       JSONObject destination = destinations.getJSONObject(i);
-      if (address.equals(destination.optString(ADDRESS_KEY, null))) {
-        return BigInteger.valueOf(destination.optLong(AMOUNT_KEY, 0L));
+      if (!address.equals(destination.optString(ADDRESS_KEY, null))) {
+        continue;
       }
+      long amount = destination.optLong(AMOUNT_KEY, -1L);
+      if (amount < 0L) {
+        continue;
+      }
+      total = (total == null ? BigInteger.ZERO : total).add(
+        BigInteger.valueOf(amount)
+      );
     }
-    return null;
+    return total;
+  }
+
+  /**
+   * This output's share of a combined transaction fee, matching
+   * {@link #splitFee}. Solo sends still report the full fee.
+   */
+  static BigInteger destinationFeeShare(
+    JSONObject transfer,
+    QueueEntity queueEntity
+  ) {
+    BigInteger fee = broadcastFee(transfer);
+    if (fee == null || queueEntity == null) {
+      return fee;
+    }
+    JSONArray destinations = transfer.optJSONArray("destinations");
+    if (destinations == null || destinations.length() <= 1) {
+      return fee;
+    }
+    int destCount = destinations.length();
+    int index = -1;
+    for (int i = 0; i < destCount; i++) {
+      JSONObject destination = destinations.getJSONObject(i);
+      if (
+        !queueEntity
+          .getTargetAddress()
+          .equals(destination.optString(ADDRESS_KEY, null))
+      ) {
+        continue;
+      }
+      BigInteger received = BigInteger.valueOf(
+        destination.optLong(AMOUNT_KEY, -1L)
+      );
+      if (received.signum() < 0) {
+        continue;
+      }
+      if (
+        !matchesQueuedAmount(
+          new BigInteger(queueEntity.getRaw()),
+          received,
+          fee
+        )
+      ) {
+        continue;
+      }
+      index = i;
+      break;
+    }
+    if (index < 0) {
+      return fee;
+    }
+    return splitFee(fee, destCount).get(index);
   }
 
   // ---------------------------------------------------------------- balances

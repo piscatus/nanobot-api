@@ -99,7 +99,11 @@ transfer that takes an hour to settle does not look lost in the meantime:
   discovery.
 - Monero asks the wallet for its transaction pool every ten seconds, and also
   treats an `in` transfer that is mined but not yet ten deep as a discovery when
-  the block-gated scan sees one.
+  the block-gated scan sees one. A send to one of the wallet's own subaddresses
+  is never reported as `in` or `pool`. Those deposits are announced as
+  discovered at broadcast and confirmed in `confirmSend` when the withdrawal
+  reaches the required depth. Several outputs to the same deposit address in
+  one transaction are one discovery (the sum), the same way they are one credit.
 - Nano has no such phase. A deposit is only ever seen once it is confirmed, so
   discovery and crediting are the same moment and there is nothing to announce
   early.
@@ -107,12 +111,14 @@ transfer that takes an hour to settle does not look lost in the meantime:
 A discovery is announced exactly once. `depositNotices` is unique on
 `(ticker, txid, addressIndex)` and the row is inserted before the message is
 written, the same insert-or-skip pattern as crediting, so re-seeing the same
-transaction on every scan costs nothing. It is a separate collection from
-`depositRecords` on purpose: a row there means money moved, and the credit paths
-must never have to ask which kind of row they are looking at. A deposit that
-already has a record is never announced as discovered, since a "discovered"
-after a "confirmed" would read as a second deposit. Notice rows expire after
-fourteen days, matching Bitcoin Core's default mempool expiry.
+transaction on every scan costs nothing. The same row later records that
+Deposit Confirmed has been sent (`confirmedAt`), so a retry of `confirmSend`
+cannot write the message twice. It is a separate collection from
+`depositRecords` on purpose: a row there means money moved, and the credit
+paths must never have to ask which kind of row they are looking at. A deposit
+that already has a record is never announced as discovered, since a
+"discovered" after a "confirmed" would read as a second deposit. Notice rows
+expire after fourteen days, matching Bitcoin Core's default mempool expiry.
 
 **Later:** if a discovered Bitcoin deposit is replaced (RBF / conflicted
 `confirmations < 0`), send one follow-up that the earlier transaction will
@@ -149,11 +155,22 @@ user still has proof that their `/send` went out. It is only written on a fresh
 broadcast: the recovery paths cannot tell whether it was announced before the
 crash, and a second "sent" would look like a second withdrawal.
 
-A Monero withdrawal to one of the bot's own deposit addresses confirms both a
-withdrawal and a deposit at once. The deposit is credited on the ledger before
-the queue entry is dropped, since that order is what keeps a crash in between
-recoverable, but its notice is held back until after the withdrawal notice so
-the two messages read in the order things happened.
+A Monero withdrawal to one of the bot's own deposit addresses is both a
+withdrawal and a deposit. Both confirmations use the same 10-deep
+`get_transfer_by_txid` check in `confirmSend`: the deposit is credited, the
+queue entry is dropped, Withdrawal Confirmed is sent, and Deposit Confirmed
+follows immediately (after every other withdrawal on that transaction, when
+several queued sends shared one transfer). The deposit scan does not announce
+self-sends. If `confirmSend` credited but died before the notices, the next
+pass still holds the queue and sends them. If the queues are already gone and
+Deposit Confirmed was skipped, the next pass sends it from the existing credit
+once no SEND remains for that transaction. `depositNotices.confirmedAt` keeps
+that exactly-once. The outgoing scan may book a missed ledger row after a
+crash, but it never writes deposit messages.
+
+A waiting withdrawal that was deferred for locked funds is retried in the same
+pass as a just-confirmed send, because that confirmation is what unlocked the
+change. It does not wait for the next block.
 
 ### Broadcast Safety
 
@@ -196,10 +213,22 @@ is in. Collapsing the last two is how a user gets paid twice.
 
 - Incoming outputs, including the wallet's own change, cannot be spent for 10
   blocks. A withdrawal the unlocked balance cannot cover is refused with `-37`.
-  That is a wait, not a failure: the entry stays queued, is retried when the
-  next block arrives, and the user is told once that it is waiting. Attempts
-  are not counted. There is no give-up timer; older entries are processed
-  before newer ones, each as its own transaction.
+  That is a wait, not a failure. The /send preview asks whether to send as
+  soon as the funds unlock or to cancel and try again later, so a swap with a
+  time limit is not queued by surprise. Confirming queues the entry; it is
+  retried when a send confirms in the same pass (that is what unlocked the
+  change) or when the next block arrives, and the user is told once that it is
+  waiting. Attempts are not counted. There is no give-up timer. Waiting
+  withdrawals are sent
+  oldest-first as one multi-destination `transfer` when the wallet can cover
+  them together, so several users waiting on the same locked change share one
+  10-block wait instead of lining up behind each other's change. The combined
+  fee is split evenly across those outputs (remainder on the last). If the
+  whole prefix does not fit, the oldest prefix that does is sent and the rest
+  keep waiting. A combined send to one Nanobot deposit address is one on-chain
+  transaction, so it is one deposit: the credit and Deposit Confirmed notice
+  use the sum of those outputs. That notice waits until every Withdrawal
+  Confirmed for the same transaction has been sent.
 - Capacity is the number of unlocked outputs. With a dozen large outputs, a
   dozen withdrawals can go out in one 20-minute window. The wallet setting
   `min-outputs-count 100` / `min-outputs-value 0.001` stops optional tidy-up
@@ -221,10 +250,14 @@ is in. Collapsing the last two is how a user gets paid twice.
   Bitcoin `walletcreatefundedpsbt`). The quoted fee is what the confirmation
   and receipt embeds show. Sent and confirmed notices name the fee the wallet
   actually took and what the recipient received, when that figure is known.
+  On a combined Monero send that share is this output's slice of the one
+  network fee, which is usually less than the single-destination quote shown
+  at confirmation.
   A refusal that is not a wait (fee larger than the
   amount, not enough funds, too many inputs, bad address) is returned before
-  any debit. A wait or an unreachable wallet leaves `networkFee` unset and the
-  frontend falls back to the estimate. `/currencies` and `/help` always show
+  any debit.   Locked funds set `delayed` on the confirmation so the user can opt in to
+  waiting. An unreachable wallet leaves `networkFee` unset and the frontend
+  falls back to the estimate. `/currencies` and `/help` always show
   the typical-size estimate: they have no destination or amount to quote.
 - A fee-bearing currency with no usable estimate refuses withdrawals rather than
   falling back to the bare minimum, which would accept an amount the fee will
@@ -262,7 +295,7 @@ is in. Collapsing the last two is how a user gets paid twice.
 | `queues` | in-flight sends, receives and representative updates |
 | `depositAddresses` | address to user mapping for hot-wallet protocols |
 | `depositRecords` | permanent record of credited deposits; the double-credit guard |
-| `depositNotices` | deposits already announced as discovered; expires after 14 days |
+| `depositNotices` | deposits already announced as discovered (and confirmed, once `confirmedAt` is set); expires after 14 days |
 | `currencies` | per-currency configuration and chain cursor state |
 
 ## Currency Configuration

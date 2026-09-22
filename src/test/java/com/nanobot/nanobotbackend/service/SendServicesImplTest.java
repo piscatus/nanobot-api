@@ -398,6 +398,61 @@ class SendServicesImplTest {
   }
 
   /**
+   * Locked funds are still sendable, but only if the user opts in to waiting.
+   * The preview confirms with a delay notice and does not debit.
+   */
+  @Test
+  void sendAsksBeforeQueueingALockedWithdrawal() {
+    stubCoreAccess("user-1");
+    stubCurrencies(true);
+    stubCreatures();
+    when(
+      transferService.processInputs(
+        anyString(),
+        any(),
+        any(),
+        anyString(),
+        anyString(),
+        anyString(),
+        anyBoolean()
+      )
+    )
+      .thenReturn(transferWithWallet("XNO", "25"));
+    when(userDetailsService.getUserDetailsByUserId(any()))
+      .thenReturn(Optional.of(botUser("0")));
+
+    CurrencyEntity entity = new CurrencyEntity();
+    entity.setTicker("XNO");
+    ChainAdapter adapter = mock(ChainAdapter.class);
+    when(currenciesService.getCurrencyByTicker("XNO"))
+      .thenReturn(Optional.of(entity));
+    when(chainAdapterRegistry.get(entity)).thenReturn(Optional.of(adapter));
+    when(adapter.quoteWithdrawalFee(entity, "25", VALID_NANO_ADDRESS))
+      .thenReturn(
+        FeeQuote.delayed(
+          new WalletRefusal(
+            WalletRefusal.Kind.FUNDS_LOCKED,
+            "The bot's Monero wallet is briefly locked."
+          )
+        )
+      );
+
+    TransferResponseDto result = sendServices.send(
+      sendRequest(false, VALID_NANO_ADDRESS)
+    );
+
+    assertNull(result.getErrorMessage());
+    assertTrue(result.getConfirmation());
+    assertTrue(result.getDelayed());
+    assertEquals(
+      "The bot's Monero wallet is briefly locked.",
+      result.getDelayNotice()
+    );
+    assertNull(result.getNetworkFee());
+    verify(queuesService, never()).createQueue(any());
+  }
+
+  /**
    * The debit and the queue insert are separate writes. If the second one does
    * not land, nothing downstream will ever send or refund the withdrawal, so
    * the balance has to be put back here.

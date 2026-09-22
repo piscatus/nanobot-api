@@ -9,19 +9,25 @@ import java.math.BigInteger;
  * it, so it reflects the inputs the wallet would actually select rather than
  * an assumed transaction size. {@code UNAVAILABLE} means the wallet could not
  * be asked or is only temporarily unable to answer; callers fall back to the
- * currency's stored estimate and let the queue sort it out. {@code REJECTED}
- * means the wallet said the withdrawal cannot be built as requested, which is
- * worth telling the user before anything is debited.
+ * currency's stored estimate. {@code DELAYED} means the withdrawal can be
+ * built once locked funds unlock, so the user should choose whether to wait.
+ * {@code REJECTED} means the wallet said the withdrawal cannot be built as
+ * requested, which is worth telling the user before anything is debited.
  */
 public record FeeQuote(Status status, BigInteger fee, WalletRefusal refusal) {
   public enum Status {
     QUOTED,
+    DELAYED,
     REJECTED,
     UNAVAILABLE,
   }
 
   public static FeeQuote quoted(BigInteger fee) {
     return new FeeQuote(Status.QUOTED, fee, null);
+  }
+
+  public static FeeQuote delayed(WalletRefusal refusal) {
+    return new FeeQuote(Status.DELAYED, null, refusal);
   }
 
   public static FeeQuote rejected(WalletRefusal refusal) {

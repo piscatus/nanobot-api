@@ -22,15 +22,16 @@ import org.springframework.data.mongodb.core.mapping.Document;
  *
  * <p>For Monero one transaction can pay several subaddresses, which are
  * separate deposits to separate users, so the key includes the address index
- * rather than being the transaction id alone. Nano has no subaddresses and
- * records the account's HD index there instead, which keeps the key shape the
- * same without ever colliding, because a block hash identifies exactly one
- * deposit.
+ * rather than being the transaction id alone. Combined withdrawals can pay
+ * the same subaddress more than once, so the key also includes the output
+ * index. Nano has no subaddresses and records the account's HD index there
+ * instead, with output index 0, which keeps the key shape the same without
+ * ever colliding, because a block hash identifies exactly one deposit.
  */
 @Document(collection = "depositRecords")
 @CompoundIndex(
-  name = "ticker_txid_index_unique",
-  def = "{'ticker': 1, 'txid': 1, 'addressIndex': 1}",
+  name = "ticker_txid_index_output_unique",
+  def = "{'ticker': 1, 'txid': 1, 'addressIndex': 1, 'outputIndex': 1}",
   unique = true
 )
 public class DepositRecordEntity extends BaseEntity {
@@ -40,6 +41,8 @@ public class DepositRecordEntity extends BaseEntity {
   private String txid;
 
   private Long addressIndex;
+
+  private Long outputIndex;
 
   private String userId;
 
@@ -67,6 +70,7 @@ public class DepositRecordEntity extends BaseEntity {
     this.ticker = ticker;
     this.txid = txid;
     this.addressIndex = addressIndex;
+    this.outputIndex = 0L;
     this.userId = userId;
     this.raw = raw;
     this.height = height;
@@ -95,6 +99,14 @@ public class DepositRecordEntity extends BaseEntity {
 
   public void setAddressIndex(Long addressIndex) {
     this.addressIndex = addressIndex;
+  }
+
+  public Long getOutputIndex() {
+    return outputIndex;
+  }
+
+  public void setOutputIndex(Long outputIndex) {
+    this.outputIndex = outputIndex;
   }
 
   public String getUserId() {

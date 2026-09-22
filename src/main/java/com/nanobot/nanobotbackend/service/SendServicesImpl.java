@@ -578,6 +578,14 @@ public class SendServicesImpl implements SendServices {
                   );
                   return transferResponseDto;
                 }
+                if (quote.status() == FeeQuote.Status.DELAYED) {
+                  transferResponseDto.setDelayed(true);
+                  if (quote.refusal() != null) {
+                    transferResponseDto.setDelayNotice(quote.refusal().reason());
+                  }
+                  transferResponseDto.setConfirmation(true);
+                  return transferResponseDto;
+                }
                 if (quote.status() == FeeQuote.Status.QUOTED) {
                   transferResponseDto.setNetworkFee(quote.fee().toString());
                 }
