@@ -52,7 +52,7 @@ public class DepositNoticeService {
       IndexOperations indexOperations = mongoTemplate.indexOps(
         DepositNoticeEntity.class
       );
-      indexOperations.ensureIndex(
+      indexOperations.createIndex(
         new Index()
           .named("ticker_txid_index_unique")
           .on("ticker", Sort.Direction.ASC)
@@ -71,7 +71,7 @@ public class DepositNoticeService {
       if (recreateTtl) {
         indexOperations.dropIndex("timestamp_ttl");
       }
-      indexOperations.ensureIndex(
+      indexOperations.createIndex(
         new Index()
           .named("timestamp_ttl")
           .on("timestamp", Sort.Direction.ASC)

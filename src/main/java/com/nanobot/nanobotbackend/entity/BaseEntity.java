@@ -1,8 +1,8 @@
 package com.nanobot.nanobotbackend.entity;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.json.JsonMapper;
 import com.nanobot.nanobotbackend.dto.BaseDto;
 import org.springframework.data.annotation.Id;
 
@@ -32,15 +32,17 @@ public class BaseEntity {
   }
 
   public String toJson(boolean includeNulls) {
-    ObjectMapper mapper = new ObjectMapper();
+    JsonMapper.Builder mapperBuilder = JsonMapper.builder();
 
     if (!includeNulls) {
-      mapper.setSerializationInclusion(JsonInclude.Include.NON_NULL);
+      mapperBuilder.changeDefaultPropertyInclusion(
+        incl -> incl.withValueInclusion(JsonInclude.Include.NON_NULL)
+      );
     }
 
     try {
-      return mapper.writeValueAsString(this);
-    } catch (JsonProcessingException e) {
+      return mapperBuilder.build().writeValueAsString(this);
+    } catch (JacksonException e) {
       e.printStackTrace();
       return null;
     }

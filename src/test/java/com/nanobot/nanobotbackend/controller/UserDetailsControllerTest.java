@@ -6,7 +6,7 @@ import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import com.nanobot.nanobotbackend.dto.StatusDto;
 import com.nanobot.nanobotbackend.dto.UserDetailsDto;
 import com.nanobot.nanobotbackend.entity.UserDetailsEntity;

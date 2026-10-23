@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+logs
+log
+target
+*.md
+.mvn
+mvnw
+mvnw.cmd
+Jenkinsfile

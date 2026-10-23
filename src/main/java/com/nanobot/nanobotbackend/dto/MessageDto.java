@@ -1,5 +1,6 @@
 package com.nanobot.nanobotbackend.dto;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
 import com.nanobot.nanobotbackend.entity.MessageEntity;
 import java.util.Date;
 import java.util.List;
@@ -43,6 +44,7 @@ public class MessageDto extends BaseDto {
     this.userId = entity.getUserId();
   }
 
+  @JsonCreator(mode = JsonCreator.Mode.PROPERTIES)
   public MessageDto(
     String userId,
     String guildId,

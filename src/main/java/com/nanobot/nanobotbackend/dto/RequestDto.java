@@ -1,5 +1,6 @@
 package com.nanobot.nanobotbackend.dto;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
 import java.util.List;
 
 public class RequestDto extends BaseDto {
@@ -72,6 +73,12 @@ public class RequestDto extends BaseDto {
 
   private Integer users;
 
+  public RequestDto() {
+    super();
+  }
+
+  /** Convenience constructor; JSON requests use the default constructor and setters. */
+  @JsonCreator(mode = JsonCreator.Mode.DISABLED)
   public RequestDto(
     String address,
     String channelId,

@@ -1,26 +1,21 @@
-# Define the build stage
-FROM maven:3.8.7-openjdk-18 AS build
+# Build stage: Maven on Eclipse Temurin 21 (LTS). The dependency step is cached
+# separately from the sources so a code change does not re-download the world.
+FROM maven:3.9-eclipse-temurin-21 AS build
 
-# Set the working directory in the Maven image
 WORKDIR /build
 
-# Copy the source code to the image
+COPY pom.xml /build/
+RUN --mount=type=cache,target=/root/.m2 mvn -B -ntp -q dependency:go-offline || true
+
 COPY src /build/src
+RUN --mount=type=cache,target=/root/.m2 mvn -B -ntp clean package -DskipTests
 
-# Copy the Maven settings
-COPY pom.xml /build
+# Runtime stage: a JRE-only Temurin 21 image (replaces the 2022 early-access JDK 18)
+FROM eclipse-temurin:21-jre
 
-# Build the application
-RUN mvn clean install -DskipTests
-
-# Define the final image
-FROM openjdk:18-ea-jdk-oracle
-
-# Set the working directory in the image
 WORKDIR /app
 
-# Copy the built jar file from the build stage to the final image
 COPY --from=build /build/target/nanobot-backend-1.0.0.jar /app/nanobot-backend-1.0.0.jar
 
-# Specify the default command to run the app
-CMD ["java", "-jar", "/app/nanobot-backend-1.0.0.jar"]
+# Let the JVM size its heap from the container memory limit (compose: mem_limit 4g)
+CMD ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/nanobot-backend-1.0.0.jar"]

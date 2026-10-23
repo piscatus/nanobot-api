@@ -1,5 +1,6 @@
 package com.nanobot.nanobotbackend.dto;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
 import com.nanobot.nanobotbackend.entity.QueueEntity;
 import java.util.Date;
 
@@ -74,6 +75,7 @@ public class QueueDto extends BaseDto {
     this.destIndex = destIndex;
   }
 
+  @JsonCreator(mode = JsonCreator.Mode.PROPERTIES)
   public QueueDto(
     String userId,
     String sourceAddress,
@@ -82,7 +84,7 @@ public class QueueDto extends BaseDto {
     String blockHash,
     String raw,
     String ticker,
-    boolean processed,
+    Boolean processed,
     String seed,
     Date timestamp,
     String transactionId
@@ -96,7 +98,7 @@ public class QueueDto extends BaseDto {
     this.sourceHash = level == LevelDto.RECEIVE ? blockHash : null;
     this.raw = raw;
     this.ticker = ticker;
-    this.processed = processed;
+    this.processed = processed != null && processed;
     this.seed = seed;
     this.timestamp = timestamp;
     this.transactionId = transactionId;

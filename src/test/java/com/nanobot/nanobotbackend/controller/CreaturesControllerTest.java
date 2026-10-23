@@ -11,7 +11,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.ObjectMapper;
 import com.nanobot.nanobotbackend.dto.CreatureDto;
 import com.nanobot.nanobotbackend.entity.CreatureEntity;
 import com.nanobot.nanobotbackend.service.CreaturesService;
